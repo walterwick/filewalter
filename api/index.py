@@ -8,21 +8,22 @@ import mimetypes
 PROFILES = {
     'bucket1': {
         'name': 'Bucket 1',
-        'access_key_id': '0a7f0017d897d5b8b982ad26e5711a21',
-        'secret_access_key': '9125af83e42fbf5237304c13ea46df52bb1aa5557227fa5f15e8df2fe45f9f31',
-        'bucket_name': 'walter',
-        'endpoint_url': 'https://a3855f747521f7ef4cea32514f2279e2.r2.cloudflarestorage.com',
-        'region': 'auto',
-        'public_url': 'https://pub-4dfa55f23513493caa0be91a20704b4c.r2.dev/'
-    },
-    'bucket2': {
-        'name': 'Bucket 2',
         'access_key_id': '112b183cdd116461df8ee2d8a647a58c',
         'secret_access_key': 'dd104010783bf0278926182bb9a1d0496c6f62907241d5f196918d7089fe005d',
         'bucket_name': 'walter',
         'endpoint_url': 'https://238a54d3f39bc03c25b5550bbd2683ed.r2.cloudflarestorage.com',
         'region': 'auto',
         'public_url': 'https://s3.walterwick.de/'
+
+    },
+    'bucket2': {
+        'name': 'Bucket 2',
+        'access_key_id': '0a7f0017d897d5b8b982ad26e5711a21',
+        'secret_access_key': '9125af83e42fbf5237304c13ea46df52bb1aa5557227fa5f15e8df2fe45f9f31',
+        'bucket_name': 'walter',
+        'endpoint_url': 'https://a3855f747521f7ef4cea32514f2279e2.r2.cloudflarestorage.com',
+        'region': 'auto',
+        'public_url': 'https://pub-4dfa55f23513493caa0be91a20704b4c.r2.dev/'
     }
 }
 DEFAULT_PROFILE = 'bucket1'
