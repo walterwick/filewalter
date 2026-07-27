@@ -1,1418 +1,1491 @@
-import os
-import boto3
-from flask import Flask, render_template_string, request, redirect, url_for, flash, send_file, Response, session
-from botocore.exceptions import ClientError
-import mimetypes
+#!/usr/bin/env python3
+"""
+S3 / Cloudflare R2 Manager - Tek dosyalık Flask uygulaması
+------------------------------------------------------------
+- 2 bucket kod içinde gömülü (daha sonra .env'e taşınabilir)
+- Arayüzden bucket ekleme / değiştirme (buckets_extra.json'a kaydedilir)
+- Sürükle-bırak, Ctrl+V ile yapıştırma, çoklu yükleme + ilerleme çubuğu
+- Klasör mantığı (prefix tabanlı), yeniden adlandırma, taşıma (aynı/farklı bucket)
+- Public link ve signed (presigned) link oluşturma
+- Önizleme: resim/video/pdf için presigned URL ile direkt tarayıcıda (server proxy yok -> hızlı)
 
-# --- CONFIGURATION ---
-PROFILES = {
+Çalıştırma:
+    pip install flask boto3
+    python s3manager.py
+    -> http://127.0.0.1:5000
+"""
+
+import os
+import io
+import json
+import mimetypes
+import posixpath
+import threading
+from datetime import datetime
+
+from flask import Flask, request, jsonify, render_template_string, Response
+import boto3
+from boto3.s3.transfer import TransferConfig
+from botocore.client import Config
+from botocore.exceptions import ClientError
+
+# ------------------------------------------------------------------
+# BUCKET KONFİGÜRASYONU (daha sonra .env'e taşıyabilirsin)
+# ------------------------------------------------------------------
+BUCKETS = {
     'bucket1': {
         'name': 'Bucket 1',
-        'access_key_id': '112b183cdd116461df8ee2d8a647a58c',
-        'secret_access_key': 'dd104010783bf0278926182bb9a1d0496c6f62907241d5f196918d7089fe005d',
-        'bucket_name': 'walter',
-        'endpoint_url': 'https://238a54d3f39bc03c25b5550bbd2683ed.r2.cloudflarestorage.com',
-        'region': 'auto',
-        'public_url': 'https://s3.walterwick.de/'
-
-    },
-    'bucket2': {
-        'name': 'Bucket 2',
         'access_key_id': '0a7f0017d897d5b8b982ad26e5711a21',
         'secret_access_key': '9125af83e42fbf5237304c13ea46df52bb1aa5557227fa5f15e8df2fe45f9f31',
         'bucket_name': 'walter',
         'endpoint_url': 'https://a3855f747521f7ef4cea32514f2279e2.r2.cloudflarestorage.com',
         'region': 'auto',
-        'public_url': 'https://pub-4dfa55f23513493caa0be91a20704b4c.r2.dev/'
-    }
+        'public_url': 'https://pub-4dfa55f23513493caa0be91a20704b4c.r2.dev/',
+    },
+    'bucket2': {
+        'name': 'Bucket 2',
+        'access_key_id': '112b183cdd116461df8ee2d8a647a58c',
+        'secret_access_key': 'dd104010783bf0278926182bb9a1d0496c6f62907241d5f196918d7089fe005d',
+        'bucket_name': 'walter',
+        'endpoint_url': 'https://238a54d3f39bc03c25b5550bbd2683ed.r2.cloudflarestorage.com',
+        'region': 'auto',
+        'public_url': 'https://s3.walterwick.de/',
+    },
 }
-DEFAULT_PROFILE = 'bucket1'
+
+DEFAULT_BUCKET = 'bucket1'
+EXTRA_BUCKETS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'buckets_extra.json')
+LIST_PAGE_SIZE = 300
+
+# Buyuk dosyalarda otomatik parcali (multipart) yukleme + paralel parca gonderimi
+TRANSFER_CONFIG = TransferConfig(
+    multipart_threshold=8 * 1024 * 1024,
+    multipart_chunksize=8 * 1024 * 1024,
+    max_concurrency=4,
+    use_threads=True,
+)
+
+_lock = threading.Lock()
+_clients = {}  # bucket_key -> boto3 client cache
+
+
+def load_extra_buckets():
+    if os.path.exists(EXTRA_BUCKETS_FILE):
+        try:
+            with open(EXTRA_BUCKETS_FILE, 'r', encoding='utf-8') as f:
+                extra = json.load(f)
+            BUCKETS.update(extra)
+        except Exception as e:
+            print(f"[uyari] buckets_extra.json okunamadi: {e}")
+
+
+def save_extra_buckets():
+    # Kod içindeki ilk 2 bucket'i tekrar dosyaya yazmıyoruz, sadece arayüzden eklenenleri.
+    base_keys = {'bucket1', 'bucket2'}
+    extra = {k: v for k, v in BUCKETS.items() if k not in base_keys}
+    with open(EXTRA_BUCKETS_FILE, 'w', encoding='utf-8') as f:
+        json.dump(extra, f, ensure_ascii=False, indent=2)
+
+
+def get_client(bucket_key):
+    with _lock:
+        if bucket_key in _clients:
+            return _clients[bucket_key]
+        cfg = BUCKETS.get(bucket_key)
+        if not cfg:
+            raise KeyError(f"Bilinmeyen bucket: {bucket_key}")
+        client = boto3.client(
+            's3',
+            aws_access_key_id=cfg['access_key_id'],
+            aws_secret_access_key=cfg['secret_access_key'],
+            endpoint_url=cfg['endpoint_url'],
+            region_name=cfg.get('region', 'auto'),
+            config=Config(signature_version='s3v4', s3={'addressing_style': 'path'}),
+        )
+        _clients[bucket_key] = client
+        return client
+
+
+load_extra_buckets()
 
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = None  # büyük dosyalara izin ver
 
-def get_active_profile_key():
-    return session.get('active_profile', DEFAULT_PROFILE)
 
-def get_current_config():
-    return PROFILES.get(get_active_profile_key(), PROFILES[DEFAULT_PROFILE])
+def bucket_cfg(bucket_key):
+    cfg = BUCKETS.get(bucket_key)
+    if not cfg:
+        raise KeyError('bucket bulunamadi')
+    return cfg
 
-def get_bucket():
-    return get_current_config()['bucket_name']
-# Increase max upload size to 16GB (default is usually unlimited but good to be explicit or avoid proxy issues)
-app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024 * 1024 
-app.secret_key = 'super-secret-key-for-flash-messages'
 
-# --- S3 HELPER ---
-def get_s3_client():
-    config = get_current_config()
-    return boto3.client(
-        's3',
-        aws_access_key_id=config['access_key_id'],
-        aws_secret_access_key=config['secret_access_key'],
-        endpoint_url=config['endpoint_url'],
-        region_name=config['region']
-    )
+def public_url_for(bucket_key, key):
+    cfg = bucket_cfg(bucket_key)
+    base = cfg.get('public_url') or ''
+    if not base:
+        return None
+    if not base.endswith('/'):
+        base += '/'
+    return base + key
 
-def list_files(prefix='', continuation_token=''):
-    s3 = get_s3_client()
+
+# ------------------------------------------------------------------
+# API: bucket listesi / ekleme
+# ------------------------------------------------------------------
+@app.route('/api/buckets', methods=['GET'])
+def api_list_buckets():
+    out = []
+    for k, v in BUCKETS.items():
+        out.append({'key': k, 'name': v.get('name', k), 'has_public_url': bool(v.get('public_url'))})
+    return jsonify({'buckets': out, 'default': DEFAULT_BUCKET})
+
+
+@app.route('/api/buckets', methods=['POST'])
+def api_add_bucket():
+    data = request.get_json(force=True)
+    key = (data.get('key') or '').strip()
+    if not key or not key.replace('_', '').isalnum():
+        return jsonify({'error': 'Gecerli bir anahtar (key) girin (harf/rakam/_)'}), 400
+    if key in BUCKETS:
+        return jsonify({'error': 'Bu key zaten mevcut'}), 400
+    required = ['name', 'access_key_id', 'secret_access_key', 'bucket_name', 'endpoint_url']
+    for r in required:
+        if not data.get(r):
+            return jsonify({'error': f'"{r}" alani zorunlu'}), 400
+    BUCKETS[key] = {
+        'name': data['name'],
+        'access_key_id': data['access_key_id'],
+        'secret_access_key': data['secret_access_key'],
+        'bucket_name': data['bucket_name'],
+        'endpoint_url': data['endpoint_url'],
+        'region': data.get('region') or 'auto',
+        'public_url': data.get('public_url') or '',
+    }
+    save_extra_buckets()
+    return jsonify({'ok': True})
+
+
+@app.route('/api/buckets/<bucket_key>', methods=['DELETE'])
+def api_delete_bucket(bucket_key):
+    if bucket_key in ('bucket1', 'bucket2'):
+        return jsonify({'error': 'Kod icindeki bucketlar silinemez'}), 400
+    if bucket_key in BUCKETS:
+        del BUCKETS[bucket_key]
+        _clients.pop(bucket_key, None)
+        save_extra_buckets()
+        return jsonify({'ok': True})
+    return jsonify({'error': 'bulunamadi'}), 404
+
+
+# ------------------------------------------------------------------
+# API: dosya listeleme (klasör mantığı = prefix + delimiter)
+# ------------------------------------------------------------------
+@app.route('/api/list', methods=['GET'])
+def api_list():
+    bucket_key = request.args.get('bucket', DEFAULT_BUCKET)
+    prefix = request.args.get('prefix', '')
+    token = request.args.get('token') or None
+    if prefix and not prefix.endswith('/'):
+        prefix += '/'
+    cfg = bucket_cfg(bucket_key)
+    client = get_client(bucket_key)
     try:
-        kwargs = {'Bucket': get_bucket(), 'Prefix': prefix, 'Delimiter': '/'}
-        if continuation_token:
-            kwargs['ContinuationToken'] = continuation_token
-            
-        response = s3.list_objects_v2(**kwargs)
+        kwargs = {'Bucket': cfg['bucket_name'], 'Prefix': prefix, 'Delimiter': '/', 'MaxKeys': LIST_PAGE_SIZE}
+        if token:
+            kwargs['ContinuationToken'] = token
+        resp = client.list_objects_v2(**kwargs)
     except ClientError as e:
-        return [], [], None, str(e)
+        return jsonify({'error': str(e)}), 500
 
     folders = []
-    if 'CommonPrefixes' in response:
-        for p in response['CommonPrefixes']:
-            folder_name = p['Prefix'][len(prefix):]
-            folders.append({'name': folder_name, 'path': p['Prefix']})
+    for cp in resp.get('CommonPrefixes', []):
+        p = cp['Prefix']
+        folders.append({'name': p[len(prefix):].rstrip('/'), 'prefix': p})
 
     files = []
-    if 'Contents' in response:
-        for obj in response['Contents']:
-            key = obj['Key']
-            if key == prefix: continue # Skip the folder marker itself
-            filename = key[len(prefix):]
-            
-            # Formate size
-            size = obj['Size']
-            for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
-                if size < 1024:
-                    size_str = f"{size:.1f} {unit}"
+    for obj in resp.get('Contents', []):
+        key = obj['Key']
+        if key == prefix:
+            continue
+        name = key[len(prefix):]
+        if not name or '/' in name:
+            continue
+        files.append({
+            'name': name,
+            'key': key,
+            'size': obj['Size'],
+            'last_modified': obj['LastModified'].strftime('%Y-%m-%d %H:%M'),
+            'public_url': public_url_for(bucket_key, key),
+        })
+
+    next_token = resp.get('NextContinuationToken') if resp.get('IsTruncated') else None
+    return jsonify({'prefix': prefix, 'folders': folders, 'files': files, 'next_token': next_token})
+
+
+# ------------------------------------------------------------------
+# API: bucket boyutu / dosya sayisi (tum bucket icin, sayfali tarama)
+# ------------------------------------------------------------------
+@app.route('/api/bucket-stats', methods=['GET'])
+def api_bucket_stats():
+    bucket_key = request.args.get('bucket', DEFAULT_BUCKET)
+    cfg = bucket_cfg(bucket_key)
+    client = get_client(bucket_key)
+    count = 0
+    total_size = 0
+    token = None
+    truncated_safety = False
+    max_pages = 200  # guvenlik siniri (~200k obje), asirilikta hesap yarim kalir ama uygulama askida kalmaz
+    pages = 0
+    try:
+        while True:
+            kwargs = {'Bucket': cfg['bucket_name'], 'MaxKeys': 1000}
+            if token:
+                kwargs['ContinuationToken'] = token
+            resp = client.list_objects_v2(**kwargs)
+            for obj in resp.get('Contents', []):
+                count += 1
+                total_size += obj['Size']
+            pages += 1
+            if resp.get('IsTruncated'):
+                token = resp.get('NextContinuationToken')
+                if pages >= max_pages:
+                    truncated_safety = True
                     break
-                size /= 1024
-            
-            files.append({
-                'name': filename,
-                'path': key,
-                'size': size_str,
-                'last_modified': obj['LastModified']
-            })
-    
-    next_token = response.get('NextContinuationToken')
-            
-    return folders, files, next_token, None
+            else:
+                break
+    except ClientError as e:
+        return jsonify({'error': str(e)}), 500
 
-# --- HTML TEMPLATE ---
-HTML_TEMPLATE = """
+    return jsonify({'count': count, 'total_size': total_size, 'partial': truncated_safety})
+
+
+# ------------------------------------------------------------------
+# API: yükleme (drag&drop, ctrl+v, çoklu dosya) - streaming upload
+# ------------------------------------------------------------------
+@app.route('/api/upload', methods=['POST'])
+def api_upload():
+    bucket_key = request.form.get('bucket', DEFAULT_BUCKET)
+    prefix = request.form.get('prefix', '')
+    if prefix and not prefix.endswith('/'):
+        prefix += '/'
+    filename = request.form.get('filename')
+    file = request.files.get('file')
+    if not file:
+        return jsonify({'error': 'dosya yok'}), 400
+
+    name = filename or file.filename or f"paste_{int(datetime.utcnow().timestamp())}"
+    key = prefix + name
+    cfg = bucket_cfg(bucket_key)
+    client = get_client(bucket_key)
+    content_type = file.mimetype or mimetypes.guess_type(name)[0] or 'application/octet-stream'
+    try:
+        client.upload_fileobj(
+            file.stream, cfg['bucket_name'], key,
+            ExtraArgs={'ContentType': content_type},
+            Config=TRANSFER_CONFIG,
+        )
+    except ClientError as e:
+        return jsonify({'error': str(e)}), 500
+
+    return jsonify({'ok': True, 'key': key, 'public_url': public_url_for(bucket_key, key)})
+
+
+# ------------------------------------------------------------------
+# API: yeni klasör (sıfır byte'lık marker obje)
+# ------------------------------------------------------------------
+@app.route('/api/mkdir', methods=['POST'])
+def api_mkdir():
+    data = request.get_json(force=True)
+    bucket_key = data.get('bucket', DEFAULT_BUCKET)
+    prefix = data.get('prefix', '')
+    name = (data.get('name') or '').strip().strip('/')
+    if not name:
+        return jsonify({'error': 'klasor adi bos olamaz'}), 400
+    if prefix and not prefix.endswith('/'):
+        prefix += '/'
+    key = f"{prefix}{name}/"
+    cfg = bucket_cfg(bucket_key)
+    client = get_client(bucket_key)
+    try:
+        client.put_object(Bucket=cfg['bucket_name'], Key=key, Body=b'')
+    except ClientError as e:
+        return jsonify({'error': str(e)}), 500
+    return jsonify({'ok': True})
+
+
+# ------------------------------------------------------------------
+# API: silme (tekli / çoklu, klasör dahil recursive)
+# ------------------------------------------------------------------
+@app.route('/api/delete', methods=['POST'])
+def api_delete():
+    data = request.get_json(force=True)
+    bucket_key = data.get('bucket', DEFAULT_BUCKET)
+    keys = data.get('keys', [])
+    if not keys:
+        return jsonify({'error': 'silinecek dosya yok'}), 400
+    cfg = bucket_cfg(bucket_key)
+    client = get_client(bucket_key)
+    all_keys = set()
+    for key in keys:
+        if key.endswith('/'):
+            all_keys.update(_list_all_keys(client, cfg['bucket_name'], key))
+        else:
+            all_keys.add(key)
+    try:
+        objs = [{'Key': k} for k in all_keys]
+        for i in range(0, len(objs), 1000):
+            client.delete_objects(Bucket=cfg['bucket_name'], Delete={'Objects': objs[i:i + 1000]})
+    except ClientError as e:
+        return jsonify({'error': str(e)}), 500
+    return jsonify({'ok': True, 'deleted': len(all_keys)})
+
+
+def _list_all_keys(client, bucket_name, prefix):
+    keys = []
+    token = None
+    while True:
+        kwargs = {'Bucket': bucket_name, 'Prefix': prefix}
+        if token:
+            kwargs['ContinuationToken'] = token
+        resp = client.list_objects_v2(**kwargs)
+        for obj in resp.get('Contents', []):
+            keys.append(obj['Key'])
+        if resp.get('IsTruncated'):
+            token = resp.get('NextContinuationToken')
+        else:
+            break
+    return keys
+
+
+# ------------------------------------------------------------------
+# API: yeniden adlandırma (rename) - aynı bucket icinde copy + delete
+# ------------------------------------------------------------------
+@app.route('/api/rename', methods=['POST'])
+def api_rename():
+    data = request.get_json(force=True)
+    bucket_key = data.get('bucket', DEFAULT_BUCKET)
+    old_key = data['key']
+    new_name = data['new_name'].strip()
+    if not new_name:
+        return jsonify({'error': 'yeni isim bos olamaz'}), 400
+    cfg = bucket_cfg(bucket_key)
+    client = get_client(bucket_key)
+
+    is_folder = old_key.endswith('/')
+    parent = posixpath.dirname(old_key.rstrip('/')) + '/' if '/' in old_key.rstrip('/') else ''
+    if parent == '/':
+        parent = ''
+
+    try:
+        if is_folder:
+            new_prefix = f"{parent}{new_name}/"
+            old_prefix = old_key
+            all_keys = _list_all_keys(client, cfg['bucket_name'], old_prefix)
+            for k in all_keys:
+                new_k = new_prefix + k[len(old_prefix):]
+                client.copy_object(Bucket=cfg['bucket_name'], CopySource={'Bucket': cfg['bucket_name'], 'Key': k}, Key=new_k)
+            objs = [{'Key': k} for k in all_keys]
+            for i in range(0, len(objs), 1000):
+                client.delete_objects(Bucket=cfg['bucket_name'], Delete={'Objects': objs[i:i + 1000]})
+        else:
+            new_key = parent + new_name
+            client.copy_object(Bucket=cfg['bucket_name'], CopySource={'Bucket': cfg['bucket_name'], 'Key': old_key}, Key=new_key)
+            client.delete_object(Bucket=cfg['bucket_name'], Key=old_key)
+    except ClientError as e:
+        return jsonify({'error': str(e)}), 500
+
+    return jsonify({'ok': True})
+
+
+# ------------------------------------------------------------------
+# API: taşıma (move) - aynı bucket (copy hizli) veya farkli bucket (stream)
+# ------------------------------------------------------------------
+@app.route('/api/move', methods=['POST'])
+def api_move():
+    data = request.get_json(force=True)
+    src_bucket = data['src_bucket']
+    dst_bucket = data['dst_bucket']
+    src_key = data['src_key']
+    dst_prefix = data.get('dst_prefix', '')
+    if dst_prefix and not dst_prefix.endswith('/'):
+        dst_prefix += '/'
+
+    src_cfg = bucket_cfg(src_bucket)
+    dst_cfg = bucket_cfg(dst_bucket)
+    src_client = get_client(src_bucket)
+    dst_client = get_client(dst_bucket)
+
+    is_folder = src_key.endswith('/')
+    keys = _list_all_keys(src_client, src_cfg['bucket_name'], src_key) if is_folder else [src_key]
+
+    try:
+        for k in keys:
+            name = k[len(src_key):] if is_folder else posixpath.basename(k)
+            dst_key = dst_prefix + (posixpath.basename(src_key.rstrip('/')) + '/' + name if is_folder else name)
+            if src_bucket == dst_bucket:
+                dst_client.copy_object(Bucket=dst_cfg['bucket_name'], CopySource={'Bucket': src_cfg['bucket_name'], 'Key': k}, Key=dst_key)
+            else:
+                obj = src_client.get_object(Bucket=src_cfg['bucket_name'], Key=k)
+                dst_client.upload_fileobj(obj['Body'], dst_cfg['bucket_name'], dst_key)
+            src_client.delete_object(Bucket=src_cfg['bucket_name'], Key=k)
+    except ClientError as e:
+        return jsonify({'error': str(e)}), 500
+
+    return jsonify({'ok': True})
+
+
+# ------------------------------------------------------------------
+# API: kopyalama (copy) - aynı/farkli bucket, orijinali silmez
+# ------------------------------------------------------------------
+@app.route('/api/copy', methods=['POST'])
+def api_copy():
+    data = request.get_json(force=True)
+    src_bucket = data['src_bucket']
+    dst_bucket = data['dst_bucket']
+    src_key = data['src_key']
+    dst_prefix = data.get('dst_prefix', '')
+    if dst_prefix and not dst_prefix.endswith('/'):
+        dst_prefix += '/'
+
+    src_cfg = bucket_cfg(src_bucket)
+    dst_cfg = bucket_cfg(dst_bucket)
+    src_client = get_client(src_bucket)
+    dst_client = get_client(dst_bucket)
+
+    name = posixpath.basename(src_key.rstrip('/'))
+    dst_key = dst_prefix + name
+    try:
+        if src_bucket == dst_bucket:
+            dst_client.copy_object(Bucket=dst_cfg['bucket_name'], CopySource={'Bucket': src_cfg['bucket_name'], 'Key': src_key}, Key=dst_key)
+        else:
+            obj = src_client.get_object(Bucket=src_cfg['bucket_name'], Key=src_key)
+            dst_client.upload_fileobj(obj['Body'], dst_cfg['bucket_name'], dst_key)
+    except ClientError as e:
+        return jsonify({'error': str(e)}), 500
+    return jsonify({'ok': True})
+
+
+# ------------------------------------------------------------------
+# API: signed URL (presigned) ve public URL
+# ------------------------------------------------------------------
+@app.route('/api/presign', methods=['GET'])
+def api_presign():
+    bucket_key = request.args.get('bucket', DEFAULT_BUCKET)
+    key = request.args.get('key')
+    expires = int(request.args.get('expires', 3600))
+    cfg = bucket_cfg(bucket_key)
+    client = get_client(bucket_key)
+    try:
+        url = client.generate_presigned_url(
+            'get_object', Params={'Bucket': cfg['bucket_name'], 'Key': key}, ExpiresIn=expires
+        )
+    except ClientError as e:
+        return jsonify({'error': str(e)}), 500
+    return jsonify({'url': url, 'expires_in': expires})
+
+
+@app.route('/api/public-url', methods=['GET'])
+def api_public_url():
+    bucket_key = request.args.get('bucket', DEFAULT_BUCKET)
+    key = request.args.get('key')
+    url = public_url_for(bucket_key, key)
+    if not url:
+        return jsonify({'error': 'bu bucket icin public_url tanimli degil'}), 400
+    return jsonify({'url': url})
+
+
+# ------------------------------------------------------------------
+# HTML arayüz
+# ------------------------------------------------------------------
+INDEX_HTML = r"""
 <!DOCTYPE html>
-<html lang="en">
+<html lang="tr">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>S3 Manager Pro</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script>
-      tailwind.config = {
-        darkMode: 'media',
-        theme: {
-          extend: {
-            colors: {
-              slate: {
-                750: '#293548',
-                850: '#151e2e',
-                950: '#020617',
-              }
-            }
-          }
-        }
-      }
-    </script>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-    <style>
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
-        body { font-family: 'Inter', sans-serif; }
-        .drag-area { border: 2px dashed #cbd5e1; transition: all 0.3s ease; }
-        .drag-area.active { border-color: #3b82f6; background-color: #eff6ff; }
-        @media (prefers-color-scheme: dark) {
-            .drag-area { border-color: #475569; }
-            .drag-area.active { border-color: #3b82f6; background-color: #1e293b; }
-        }
-        /* Custom Scrollbar */
-        ::-webkit-scrollbar { width: 8px; }
-        ::-webkit-scrollbar-track { background: #f1f1f1; }
-        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
-        ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>S3 / R2 Manager</title>
+<style>
+  :root{
+    --bg:#111318; --panel:#16181f; --panel2:#1c1f28; --border:#282c36; --border-soft:#20232c;
+    --text:#e4e6eb; --muted:#8a8f9c; --accent:#5b7fdb; --accent-soft:#232a3e;
+    --danger:#e0596b; --radius:8px; --radius-sm:6px;
+  }
+  *{box-sizing:border-box;}
+  body{margin:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;
+       background:var(--bg);color:var(--text);font-size:13px;-webkit-font-smoothing:antialiased;}
+  #app{display:flex;flex-direction:column;height:100vh;}
+  svg{display:block;}
+  .icon{width:15px;height:15px;stroke:currentColor;fill:none;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0;}
+
+  header{display:flex;align-items:center;gap:8px;padding:9px 14px;background:var(--panel);
+         border-bottom:1px solid var(--border-soft);flex-wrap:wrap;}
+  header h1{font-size:13px;margin:0;font-weight:600;white-space:nowrap;color:var(--muted);
+            letter-spacing:.02em;display:flex;align-items:center;gap:6px;}
+  select, button, input{font-family:inherit;}
+  select#bucketSelect, select#sortSelect{background:var(--panel2);color:var(--text);border:1px solid var(--border);
+       border-radius:var(--radius-sm);padding:6px 8px;font-size:12.5px;}
+  .bucket-stats{font-size:11px;color:var(--muted);white-space:nowrap;cursor:pointer;padding:4px 2px;}
+  .bucket-stats:hover{color:var(--text);}
+  .btn{background:transparent;color:var(--text);border:1px solid var(--border);border-radius:var(--radius-sm);
+       padding:6px 10px;font-size:12.5px;cursor:pointer;display:inline-flex;align-items:center;gap:6px;
+       transition:.12s;white-space:nowrap;}
+  .btn:hover{background:var(--panel2);border-color:#3a3f4d;}
+  .btn.primary{background:var(--accent);border-color:var(--accent);color:#fff;}
+  .btn.primary:hover{filter:brightness(1.08);}
+  .btn.danger{color:var(--danger);}
+  .btn.danger:hover{background:rgba(224,89,107,.1);border-color:var(--danger);}
+  .btn.small{padding:4px 8px;font-size:11.5px;}
+  #searchBox{flex:1;min-width:110px;background:var(--panel2);border:1px solid var(--border);
+       color:var(--text);border-radius:var(--radius-sm);padding:6px 10px;font-size:12.5px;}
+  #searchBox:focus, select:focus, input:focus{outline:none;border-color:var(--accent);}
+
+  .breadcrumb{display:flex;align-items:center;gap:2px;padding:8px 14px;background:var(--panel);
+       border-bottom:1px solid var(--border-soft);font-size:12px;color:var(--muted);flex-wrap:wrap;}
+  .breadcrumb span{cursor:pointer;padding:3px 5px;border-radius:5px;display:inline-flex;align-items:center;gap:4px;}
+  .breadcrumb span:hover{background:var(--panel2);color:var(--text);}
+  .breadcrumb .sep{color:#3a3f4d;cursor:default;padding:0 2px;}
+
+  #dropzone{flex:1;overflow-y:auto;position:relative;padding:12px 14px 84px;}
+  #dropzone.dragover::after{content:'Dosyaları buraya bırak';position:fixed;inset:0;
+       background:rgba(91,127,219,.08);border:2px dashed var(--accent);z-index:50;
+       display:flex;align-items:center;justify-content:center;font-size:15px;color:var(--accent);
+       pointer-events:none;}
+
+  #grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(138px,1fr));gap:8px;}
+  .item{background:var(--panel);border:1px solid var(--border-soft);border-radius:var(--radius);
+        padding:8px;cursor:pointer;position:relative;user-select:none;transition:.1s;}
+  .item:hover{border-color:#3a3f4d;}
+  .item.selected{border-color:var(--accent);background:var(--accent-soft);}
+  .thumb{width:100%;aspect-ratio:1/1;border-radius:var(--radius-sm);background:var(--panel2);display:flex;
+         align-items:center;justify-content:center;overflow:hidden;margin-bottom:6px;color:var(--muted);
+         position:relative;}
+  .thumb svg{width:26px;height:26px;}
+  .thumb-folder{background:rgba(224,180,57,.14);color:#e0b039;}
+  .thumb-image{background:rgba(91,127,219,.14);color:#82a3ec;}
+  .thumb-video{background:rgba(168,113,219,.14);color:#b990e8;}
+  .thumb-pdf{background:rgba(224,89,107,.14);color:#e4869a;}
+  .thumb-archive{background:rgba(219,150,91,.14);color:#e5ae7c;}
+  .thumb-audio{background:rgba(78,201,150,.14);color:#7be0af;}
+  .thumb-doc{background:rgba(91,158,219,.14);color:#82bced;}
+  .thumb-sheet{background:rgba(105,201,91,.14);color:#98e082;}
+  .thumb-file{background:var(--panel2);color:var(--muted);}
+  .ext-badge{position:absolute;bottom:3px;right:3px;font-size:8px;background:rgba(17,19,24,.8);
+       color:var(--muted);padding:1px 4px;border-radius:4px;letter-spacing:.02em;font-weight:600;}
+  .item .name{font-size:12px;word-break:break-word;line-height:1.3;max-height:2.6em;overflow:hidden;}
+  .item .meta{font-size:10.5px;color:var(--muted);margin-top:3px;}
+  .item .menu-btn{position:absolute;top:5px;right:5px;background:rgba(17,19,24,.7);border:none;
+       color:#fff;border-radius:5px;width:20px;height:20px;cursor:pointer;display:none;
+       align-items:center;justify-content:center;}
+  .item .menu-btn svg{width:13px;height:13px;}
+  .item:hover .menu-btn{display:flex;}
+  .select-btn{position:absolute;top:5px;left:5px;width:18px;height:18px;border-radius:5px;
+       border:1.5px solid var(--border);background:rgba(17,19,24,.55);cursor:pointer;display:none;
+       align-items:center;justify-content:center;padding:0;z-index:2;}
+  .select-btn svg{color:#fff;}
+  .item:hover .select-btn, .item.selected .select-btn{display:flex;}
+  .item.selected .select-btn{background:var(--accent);border-color:var(--accent);}
+
+  #grid.list-view{display:flex;flex-direction:column;gap:2px;}
+  #grid.list-view .item{display:flex;align-items:center;gap:10px;padding:6px 8px;}
+  #grid.list-view .thumb{width:26px;height:26px;aspect-ratio:auto;margin-bottom:0;flex-shrink:0;}
+  #grid.list-view .thumb svg{width:15px;height:15px;}
+  #grid.list-view .ext-badge{display:none;}
+  #grid.list-view .name{flex:1;max-height:none;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  #grid.list-view .meta{margin-top:0;white-space:nowrap;flex-shrink:0;}
+  #grid.list-view .menu-btn, #grid.list-view .select-btn{position:static;display:flex;flex-shrink:0;}
+  #grid.list-view .select-btn{background:transparent;border-color:var(--border);}
+  #grid.list-view .select-btn svg{color:var(--muted);}
+  #grid.list-view .item.selected .select-btn{background:var(--accent);border-color:var(--accent);}
+  #grid.list-view .item.selected .select-btn svg{color:#fff;}
+  #grid.list-view .menu-btn{background:transparent;color:var(--muted);}
+
+  #ctxmenu{position:fixed;background:var(--panel2);border:1px solid var(--border);border-radius:var(--radius);
+       padding:4px;z-index:200;min-width:170px;box-shadow:0 8px 24px rgba(0,0,0,.35);display:none;}
+  #ctxmenu button{display:flex;width:100%;text-align:left;background:none;border:none;color:var(--text);
+       padding:7px 9px;border-radius:5px;cursor:pointer;font-size:12.5px;gap:8px;align-items:center;}
+  #ctxmenu button:hover{background:var(--panel);}
+  #ctxmenu button.danger{color:var(--danger);}
+  #ctxmenu hr{border:none;border-top:1px solid var(--border-soft);margin:4px 2px;}
+
+  .modal-back{position:fixed;inset:0;background:rgba(10,11,14,.6);display:none;align-items:center;
+       justify-content:center;z-index:300;}
+  .modal{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);
+       padding:18px;width:min(420px,90vw);max-height:85vh;overflow-y:auto;}
+  .modal h3{margin-top:0;font-size:13.5px;font-weight:600;color:var(--text);}
+  .modal label{display:block;font-size:11px;color:var(--muted);margin:10px 0 4px;}
+  .modal input, .modal select{width:100%;background:var(--panel2);border:1px solid var(--border);
+       color:var(--text);border-radius:var(--radius-sm);padding:8px 9px;font-size:12.5px;}
+  .modal .row-btns{display:flex;gap:8px;justify-content:flex-end;margin-top:16px;}
+  .link-row{display:flex;gap:6px;margin-top:6px;}
+  .link-row input{flex:1;}
+
+  #toasts{position:fixed;bottom:14px;right:14px;z-index:400;display:flex;flex-direction:column;gap:6px;}
+  .toast{background:var(--panel2);border:1px solid var(--border);border-left:2px solid var(--accent);
+       padding:8px 12px;border-radius:var(--radius-sm);font-size:12px;box-shadow:0 4px 14px rgba(0,0,0,.3);
+       animation:slidein .15s ease;}
+  .toast.error{border-left-color:var(--danger);}
+  .toast.success{border-left-color:#4fae7c;}
+  @keyframes slidein{from{transform:translateX(20px);opacity:0}to{transform:translateX(0);opacity:1}}
+
+  #uploads{position:fixed;bottom:14px;left:14px;z-index:400;display:flex;flex-direction:column;gap:5px;
+       max-width:260px;}
+  .up-item{background:var(--panel2);border:1px solid var(--border);border-radius:var(--radius-sm);padding:7px 9px;
+       font-size:11px;}
+  .up-item .bar{height:3px;background:var(--border);border-radius:2px;margin-top:5px;overflow:hidden;}
+  .up-item .bar > div{height:100%;background:var(--accent);width:0%;transition:.15s;}
+  .up-item .u-pct{font-size:10px;color:var(--muted);margin-top:3px;}
+
+  .selection-bar{position:sticky;bottom:0;background:var(--panel2);border:1px solid var(--border);
+       border-radius:var(--radius);padding:7px 10px;display:none;align-items:center;gap:8px;margin-top:8px;}
+  .selection-bar span{font-size:12px;color:var(--muted);margin-right:2px;}
+
+  #previewModal .modal{display:flex;flex-direction:column;width:min(920px,94vw);
+       max-height:92vh;overflow:hidden;padding:16px;}
+  #previewModal .modal h3{flex-shrink:0;margin:0 0 10px;}
+  #previewModal .modal .row-btns{flex-shrink:0;}
+  .preview-wrap{position:relative;display:flex;align-items:center;justify-content:center;
+       width:100%;height:74vh;flex-shrink:0;}
+  .preview-wrap .previewBody{width:100%;height:100%;min-width:0;}
+  #previewModal .previewBody{display:flex;align-items:center;justify-content:center;width:100%;height:100%;
+       overflow:hidden;background:#000;border-radius:var(--radius-sm);}
+  #previewModal img, #previewModal video{max-width:100%;max-height:100%;width:auto;height:auto;object-fit:contain;}
+  #previewModal iframe{width:100%;height:100%;border:none;background:#fff;}
+  #previewModal pre{max-height:100%;overflow:auto;width:100%;box-sizing:border-box;}
+  .preview-nav{position:absolute;top:50%;transform:translateY(-50%);background:rgba(17,19,24,.6);
+       border:1px solid var(--border);color:#fff;width:32px;height:32px;border-radius:50%;
+       display:flex;align-items:center;justify-content:center;cursor:pointer;z-index:5;padding:0;}
+  .preview-nav:hover{background:rgba(17,19,24,.9);border-color:var(--accent);}
+  .preview-nav.prev{left:6px;}
+  .preview-nav.next{right:6px;}
+  .preview-nav svg{width:17px;height:17px;stroke:currentColor;fill:none;stroke-width:2;
+       stroke-linecap:round;stroke-linejoin:round;}
+
+  .upload-row{display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--border-soft);}
+  .upload-row:last-child{border-bottom:none;}
+  .upload-row .icon{color:var(--muted);}
+  .upload-row input{flex:1;}
+  .upload-row .u-status{font-size:10.5px;color:var(--muted);white-space:nowrap;}
+  .upload-row .u-status.dup{color:#d9a441;}
+  .upload-list{max-height:260px;overflow-y:auto;margin-top:4px;}
+
+  .load-more-wrap{display:flex;justify-content:center;margin-top:14px;}
+  #loadMoreBtn{min-width:160px;justify-content:center;}
+
+  @media (max-width:640px){
+    header h1{display:none;}
+    #grid{grid-template-columns:repeat(auto-fill,minmax(98px,1fr));gap:6px;}
+    .modal{width:94vw;}
+    #previewModal .modal{width:96vw;max-height:94vh;padding:12px;}
+    .preview-wrap{height:62vh;}
+    .preview-nav{width:28px;height:28px;}
+    .preview-nav svg{width:15px;height:15px;}
+    #previewModal .modal .row-btns{flex-wrap:wrap;}
+  }
+</style>
 </head>
-<body class="bg-slate-50 text-slate-800 dark:bg-slate-900 dark:text-slate-200 min-h-screen transition-colors duration-200">
+<body>
+<div id="app">
+  <header>
+    <h1>S3 Manager</h1>
+    <select id="bucketSelect"></select>
+    <button class="btn" id="addBucketBtn">Bucket</button>
+    <button class="btn" id="newFolderBtn">Klasör</button>
+    <button class="btn primary" id="uploadBtn">Yükle</button>
+    <input type="file" id="fileInput" multiple style="display:none;">
+    <button class="btn small" id="viewToggleBtn" title="Görünümü değiştir"></button>
+    <select id="sortSelect" title="Sırala">
+      <option value="name_asc">İsim A-Z</option>
+      <option value="name_desc">İsim Z-A</option>
+      <option value="size_desc">Boyut (büyük-küçük)</option>
+      <option value="size_asc">Boyut (küçük-büyük)</option>
+      <option value="date_desc">Tarih (yeni-eski)</option>
+      <option value="date_asc">Tarih (eski-yeni)</option>
+    </select>
+    <span id="bucketStats" class="bucket-stats" title="Yeniden hesaplamak için tıkla"></span>
+    <input id="searchBox" placeholder="Ara...">
+  </header>
 
-    <!-- Top Navigation -->
-    <nav class="bg-white dark:bg-slate-800 shadow-sm border-b border-slate-200 dark:border-slate-700 fixed w-full top-0 z-50 transition-colors duration-200">
-        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-            <div class="flex justify-between h-16">
-                <div class="flex">
-                    <div class="flex-shrink-0 flex items-center">
-                        <a href="/" class="text-2xl font-bold text-blue-600 hover:text-blue-700 transition-colors">
-                            <i class="fa-brands fa-aws mr-2"></i>S3 Manager
-                        </a>
-                    </div>
-                </div>
-                <div class="flex items-center space-x-4 relative" id="account-dropdown-container">
-                    <button onclick="toggleBucketDropdown()" class="text-xs text-slate-500 bg-slate-100 px-3 py-1 rounded-full hover:bg-slate-200 transition-colors flex items-center focus:outline-none dark:bg-slate-700 dark:text-slate-300 dark:hover:bg-slate-600">
-                        <i class="fa-solid fa-server mr-1"></i> Bucket: <span class="font-medium text-slate-700 dark:text-slate-200 ml-1">{{ current_profile_name }}</span> 
-                        <i class="fa-solid fa-chevron-down ml-2 text-[10px]"></i>
-                    </button>
-                    <div id="bucketMenu" class="hidden absolute right-0 top-full mt-2 w-48 bg-white dark:bg-slate-800 rounded-lg shadow-lg py-2 z-50 border border-slate-100 dark:border-slate-700">
-                        <a href="{{ url_for('set_bucket', name='bucket1') }}" class="block px-4 py-2 text-sm text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700 hover:text-blue-600 dark:hover:text-blue-400">
-                            <i class="fa-solid fa-database mr-2 text-slate-400"></i>Bucket 1
-                        </a>
-                        <a href="{{ url_for('set_bucket', name='bucket2') }}" class="block px-4 py-2 text-sm text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700 hover:text-blue-600 dark:hover:text-blue-400">
-                            <i class="fa-solid fa-database mr-2 text-slate-400"></i>Bucket 2
-                        </a>
-                    </div>
-                </div>
-            </div>
-        </div>
-    </nav>
+  <div class="breadcrumb" id="breadcrumb"></div>
 
-    <!-- Main Content -->
-    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 pt-24 pb-12">
-        
-        <!-- Flash Messages -->
-        {% with messages = get_flashed_messages(with_categories=true) %}
-          {% if messages %}
-            <div class="mb-6">
-              {% for category, message in messages %}
-                <div class="p-4 mb-2 rounded-lg shadow-sm border
-                    {% if category == 'error' %} bg-red-50 dark:bg-red-900/20 border-red-200 dark:border-red-900/50 text-red-700 dark:text-red-400
-                    {% else %} bg-green-50 dark:bg-green-900/20 border-green-200 dark:border-green-900/50 text-green-700 dark:text-green-400 {% endif %} flex items-center">
-                    <i class="fa-solid {% if category == 'error' %}fa-circle-exclamation{% else %}fa-circle-check{% endif %} mr-2"></i>
-                    {{ message }}
-                </div>
-              {% endfor %}
-            </div>
-          {% endif %}
-        {% endwith %}
-
-        <!-- Actions Bar -->
-        <div class="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-6">
-            <!-- Breadcrumbs -->
-            <nav class="flex text-slate-500 dark:text-slate-400 overflow-x-auto whitespace-nowrap pb-1 md:pb-0">
-                <a href="{{ url_for('index') }}" class="hover:text-blue-600 dark:hover:text-blue-400 transition-colors flex items-center">
-                    <i class="fa-solid fa-house mr-1"></i> Home
-                </a>
-                {% set parts = prefix.strip('/').split('/') %}
-                {% set current_path = namespace(value='') %}
-                {% if prefix %}
-                    {% for part in parts %}
-                        {% if part %}
-                            {% set current_path.value = current_path.value + part + '/' %}
-                            <span class="mx-2 text-slate-300 dark:text-slate-600">/</span>
-                            <a href="{{ url_for('index', prefix=current_path.value) }}" class="font-medium hover:text-blue-600 dark:hover:text-blue-400 transition-colors text-slate-700 dark:text-slate-300">
-                                {{ part }}
-                            </a>
-                        {% endif %}
-                    {% endfor %}
-                {% endif %}
-            </nav>
-
-            <div class="flex items-center space-x-2">
-                <button onclick="document.getElementById('newFolderModal').classList.remove('hidden')" class="bg-white dark:bg-slate-700 border border-slate-300 dark:border-slate-600 text-slate-700 dark:text-slate-200 px-4 py-2 rounded-lg hover:bg-slate-50 dark:hover:bg-slate-600 hover:text-blue-600 dark:hover:text-blue-400 transition-all text-sm font-medium shadow-sm">
-                    <i class="fa-solid fa-folder-plus mr-2"></i>New Folder
-                </button>
-                
-                <!-- Upload Buttons Group -->
-                <div class="relative inline-block text-left group">
-                    <button class="bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700 transition-all text-sm font-medium shadow-md hover:shadow-lg flex items-center">
-                        <i class="fa-solid fa-cloud-arrow-up mr-2"></i>Upload
-                        <i class="fa-solid fa-chevron-down ml-2 text-xs"></i>
-                    </button>
-                    <!-- Dropdown -->
-                    <div class="hidden group-hover:block absolute right-0 mt-0 w-48 bg-white dark:bg-slate-800 rounded-md shadow-lg py-1 z-20 border border-slate-100 dark:border-slate-700">
-                        <a href="#" onclick="document.getElementById('uploadModal').classList.remove('hidden'); setupUpload('file')" class="block px-4 py-2 text-sm text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700">
-                            <i class="fa-solid fa-file mr-2 text-slate-400"></i> Upload Files
-                        </a>
-                        <a href="#" onclick="document.getElementById('uploadModal').classList.remove('hidden'); setupUpload('folder')" class="block px-4 py-2 text-sm text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700">
-                            <i class="fa-solid fa-folder mr-2 text-slate-400"></i> Upload Folder
-                        </a>
-                    </div>
-                </div>
-            </div>
-        </div>
-
-        <!-- File Browser -->
-        <div class="bg-white dark:bg-slate-800 rounded-xl shadow-sm border border-slate-200 dark:border-slate-700 overflow-hidden mb-6 transition-colors duration-200">
-            {% if not folders and not files %}
-                <div class="p-12 text-center text-slate-400 dark:text-slate-500">
-                    <i class="fa-regular fa-folder-open text-6xl mb-4 text-slate-200 dark:text-slate-700"></i>
-                    <p class="text-lg">This folder is empty</p>
-                    <p class="text-sm mt-2">Upload files or create a new folder to get started.</p>
-                </div>
-            {% else %}
-                <div class="overflow-x-auto">
-                    <table class="w-full text-left text-sm text-slate-600 dark:text-slate-300">
-                        <thead class="bg-slate-50 dark:bg-slate-750 text-xs uppercase font-semibold text-slate-500 dark:text-slate-400 border-b border-slate-200 dark:border-slate-700">
-                            <tr>
-                                <th class="px-6 py-4 rounded-tl-lg">Name</th>
-                                <th class="px-6 py-4">Size</th>
-                                <th class="px-6 py-4">Last Modified</th>
-                                <th class="px-6 py-4 text-right rounded-tr-lg">Actions</th>
-                            </tr>
-                        </thead>
-                        <tbody class="divide-y divide-slate-100 dark:divide-slate-700">
-                            <!-- Folders -->
-                            {% for folder in folders %}
-                            <tr class="hover:bg-slate-50 dark:hover:bg-slate-750 transition-colors group border-b border-slate-100 dark:border-slate-700 last:border-0">
-                                <td class="px-6 py-3 whitespace-nowrap cursor-pointer" onclick="window.location.href='{{ url_for('index', prefix=folder.path) }}'">
-                                    <div class="flex items-center text-slate-700 dark:text-slate-200 font-medium">
-                                        <i class="fa-solid fa-folder text-yellow-400 text-2xl mr-3"></i>
-                                        {{ folder.name }}
-                                    </div>
-                                </td>
-                                <td class="px-6 py-3 text-slate-400">-</td>
-                                <td class="px-6 py-3 text-slate-400">-</td>
-                                <td class="px-6 py-3 text-right space-x-1">
-                                    <button onclick="event.stopPropagation(); openRenameModal('{{ folder.path }}')" class="text-slate-400 hover:text-orange-500 px-2 py-1 rounded transition-colors" title="Rename Folder">
-                                        <i class="fa-solid fa-pen-to-square"></i>
-                                    </button>
-                                     <form action="{{ url_for('delete') }}" method="POST" class="inline" onsubmit="return confirm('Delete folder {{ folder.name }} and all its contents?');">
-                                        <input type="hidden" name="key" value="{{ folder.path }}">
-                                        <input type="hidden" name="prefix" value="{{ prefix }}">
-                                        <button type="submit" class="text-slate-400 hover:text-red-500 px-2 py-1 rounded transition-colors" title="Delete Folder">
-                                            <i class="fa-regular fa-trash-can"></i>
-                                        </button>
-                                    </form>
-                                </td>
-                            </tr>
-                            {% endfor %}
-
-                            <!-- Files -->
-                            {% for file in files %}
-                            <tr class="hover:bg-slate-50 dark:hover:bg-slate-750 transition-colors group border-b border-slate-100 dark:border-slate-700 last:border-0">
-                                <td class="px-6 py-3 font-medium text-slate-700 dark:text-slate-200">
-                                    <div class="flex items-center space-x-3">
-                                        <!-- Preview Click -->
-                                        <!-- Preview Click -->
-                                        <button onclick="openPreview('{{ file.path }}', '{{ file.name }}')" class="w-8 h-8 rounded-lg bg-slate-100 dark:bg-slate-700 text-slate-500 dark:text-slate-400 hover:text-blue-600 dark:hover:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/30 flex items-center justify-center text-lg transition-colors" title="Preview">
-                                           {% if file.name.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp')) %} 
-                                                <i class="fa-regular fa-image"></i>
-                                           {% elif file.name.lower().endswith(('.pdf')) %}
-                                                <i class="fa-regular fa-file-pdf text-red-500"></i>
-                                           {% elif file.name.lower().endswith(('.mp4', '.webm', '.mov')) %}
-                                                <i class="fa-regular fa-file-video text-blue-500"></i>
-                                           {% else %}
-                                                <i class="fa-regular fa-file"></i>
-                                           {% endif %}
-                                        </button>
-                                        
-                                        <!-- New Tab Click -->
-                                        <button onclick="openInNewTab('{{ file.path }}')" class="hover:text-blue-600 dark:hover:text-blue-400 hover:underline text-left">
-                                            {{ file.name }}
-                                        </button>
-                                    </div>
-                                </td>
-                                <td class="px-6 py-3">{{ file.size }}</td>
-                                <td class="px-6 py-3">{{ file.last_modified.strftime('%Y-%m-%d %H:%M') }}</td>
-                                <td class="px-6 py-3 text-right space-x-1">
-                                    <button onclick="openRenameModal('{{ file.path }}')" class="text-slate-400 hover:text-orange-500 px-2 py-1 rounded transition-colors" title="Rename/Move">
-                                        <i class="fa-solid fa-pen-to-square"></i>
-                                    </button>
-                                    <button onclick="copyLink('{{ file.path }}')" class="text-slate-400 hover:text-green-600 px-2 py-1 rounded transition-colors" title="Copy Link">
-                                        <i class="fa-solid fa-link"></i>
-                                    </button>
-                                    <a href="{{ url_for('download', key=file.path) }}" class="text-slate-400 hover:text-blue-600 px-2 py-1 rounded transition-colors" title="Download">
-                                        <i class="fa-solid fa-download"></i>
-                                    </a>
-                                    <form action="{{ url_for('delete') }}" method="POST" class="inline" onsubmit="return confirm('Delete file {{ file.name }}?');">
-                                        <input type="hidden" name="key" value="{{ file.path }}">
-                                        <input type="hidden" name="prefix" value="{{ prefix }}">
-                                        <button type="submit" class="text-slate-400 hover:text-red-500 px-2 py-1 rounded transition-colors" title="Delete">
-                                            <i class="fa-regular fa-trash-can"></i>
-                                        </button>
-                                    </form>
-                                </td>
-                            </tr>
-                            {% endfor %}
-                        </tbody>
-                    </table>
-                </div>
-            {% endif %}
-        </div>
-        
-        <!-- Infinite Scroll Sentinel -->
-        <div id="sentinel" data-next-token="{{ next_token if next_token else '' }}" class="h-20 text-center py-8">
-            {% if next_token %}
-             <div id="loadingSpinner" class="text-slate-400 text-sm">
-                <i class="fa-solid fa-circle-notch fa-spin mr-2"></i> Loading more files...
-             </div>
-            {% endif %}
-        </div>
+  <div id="dropzone">
+    <div id="grid"></div>
+    <div class="load-more-wrap" id="loadMoreWrap" style="display:none;">
+      <button class="btn" id="loadMoreBtn" onclick="loadMore()">Daha Fazla Yükle</button>
     </div>
-
-    <!-- Upload Modal -->
-    <div id="uploadModal" class="hidden fixed inset-0 z-50 overflow-y-auto" aria-labelledby="modal-title" role="dialog" aria-modal="true">
-        <div class="flex items-end justify-center min-h-screen pt-4 px-4 pb-20 text-center sm:block sm:p-0">
-            <div class="fixed inset-0 bg-slate-900 bg-opacity-75 transition-opacity" aria-hidden="true" onclick="handleModalClose()"></div>
-            <span class="hidden sm:inline-block sm:align-middle sm:h-screen" aria-hidden="true">&#8203;</span>
-            <div class="inline-block align-bottom bg-white dark:bg-slate-800 rounded-xl text-left overflow-hidden shadow-xl transform transition-all sm:my-8 sm:align-middle sm:max-w-lg sm:w-full">
-                <div class="bg-white dark:bg-slate-800 px-4 pt-5 pb-4 sm:p-6 sm:pb-4">
-                    <h3 class="text-lg leading-6 font-medium text-slate-900 dark:text-white mb-4" id="uploadModalTitle">Upload File</h3>
-                    
-                    <!-- Custom Path Input -->
-                    <div class="mb-4">
-                        <label class="block text-xs font-medium text-slate-500 dark:text-slate-400 uppercase mb-1">Upload To (Folder Path)</label>
-                        <div class="relative rounded-md shadow-sm">
-                            <div class="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
-                                <span class="text-slate-400 sm:text-sm">/</span>
-                            </div>
-                            <input type="text" id="targetPathInput" class="focus:ring-blue-500 focus:border-blue-500 block w-full pl-7 sm:text-sm border-slate-300 dark:border-slate-600 rounded-md border p-2 bg-white dark:bg-slate-700 text-slate-900 dark:text-white placeholder-slate-400" placeholder="folder/subfolder">
-                        </div>
-                        <p class="text-xs text-slate-400 mt-1">Leave empty for root, or type a folder path (e.g. 'images/2024'). Will be created if it doesn't exist.</p>
-                    </div>
-
-                    <div id="uploadUi">
-                        <div class="drag-area w-full h-40 rounded-xl bg-slate-50 dark:bg-slate-700/50 flex flex-col items-center justify-center text-slate-400 dark:text-slate-500 mb-4 cursor-pointer relative" id="dragArea">
-                            <input type="file" class="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10" id="fileInput" onchange="filesSelected(this)" multiple>
-                            <i class="fa-solid fa-cloud-arrow-up text-4xl mb-2"></i>
-                            <p class="text-sm font-medium" id="dropText">Drag & Drop or Click to Browse</p>
-                            <p class="text-xs text-slate-400 mt-1" id="fileStats"></p>
-                        </div>
-                    </div>
-                    
-                    <!-- Total Progress -->
-                    <div id="totalProgress" class="hidden mb-6 bg-blue-50 dark:bg-blue-900/20 p-4 rounded-xl border border-blue-100 dark:border-blue-900/30">
-                        <div class="flex justify-between text-sm font-bold text-blue-900 dark:text-blue-300 mb-2">
-                            <span id="totalText">Preparing...</span>
-                            <span id="totalPercent">0%</span>
-                        </div>
-                        <div class="w-full bg-blue-200 dark:bg-blue-900/40 rounded-full h-3">
-                            <div id="totalBar" class="bg-blue-600 dark:bg-blue-500 h-3 rounded-full transition-all duration-300 shadow-sm" style="width: 0%"></div>
-                        </div>
-                    </div>
-
-                    <!-- Individual Progress Container -->
-                    <div id="progressContainer" class="max-h-60 overflow-y-auto hidden space-y-3 mb-4 pr-2">
-                        <!-- Progress items will be injected here -->
-                    </div>
-
-                    <div class="mt-5 sm:mt-6 sm:grid sm:grid-cols-2 sm:gap-3 sm:grid-flow-row-dense">
-                        <button type="button" id="startUploadBtn" class="hidden w-full inline-flex justify-center rounded-lg border border-transparent shadow-sm px-4 py-2 bg-green-600 text-base font-medium text-white hover:bg-green-700 focus:outline-none sm:col-start-2 sm:text-sm" onclick="startUpload()">
-                            Start Upload
-                        </button>
-                        <button type="button" id="closeBtn" class="w-full inline-flex justify-center rounded-lg border border-slate-300 dark:border-slate-600 shadow-sm px-4 py-2 bg-white dark:bg-slate-700 text-base font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-600 focus:outline-none sm:col-start-1 sm:text-sm" onclick="handleModalClose()">
-                            Close
-                        </button>
-                    </div>
-                </div>
-            </div>
-        </div>
+    <div class="selection-bar" id="selectionBar">
+      <span id="selCount"></span>
+      <button class="btn small" onclick="copySelectedLinks()">Linkleri Kopyala</button>
+      <button class="btn small" onclick="openMoveModal()">Taşı</button>
+      <button class="btn small danger" onclick="deleteSelected()">Sil</button>
+      <button class="btn small" onclick="clearSelection()">Vazgeç</button>
     </div>
+  </div>
+</div>
 
-    <!-- Rename Modal -->
-    <div id="renameModal" class="hidden fixed inset-0 z-50 overflow-y-auto">
-        <div class="flex items-end justify-center min-h-screen pt-4 px-4 pb-20 text-center sm:block sm:p-0">
-            <div class="fixed inset-0 bg-slate-900 bg-opacity-75" onclick="document.getElementById('renameModal').classList.add('hidden')"></div>
-            <span class="hidden sm:inline-block sm:align-middle sm:h-screen">&#8203;</span>
-            <div class="inline-block align-bottom bg-white dark:bg-slate-800 rounded-xl text-left overflow-hidden shadow-xl transform transition-all sm:my-8 sm:align-middle sm:max-w-lg sm:w-full">
-                <div class="bg-white dark:bg-slate-800 px-4 pt-5 pb-4 sm:p-6 sm:pb-4">
-                    <h3 class="text-lg leading-6 font-medium text-slate-900 dark:text-white mb-4">Rename / Move File</h3>
-                    <form action="{{ url_for('rename') }}" method="POST">
-                        <input type="hidden" name="old_key" id="renameOldKey">
-                        <div class="mb-4">
-                            <label for="renameNewKey" class="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-2">New Path (Folder + Filename)</label>
-                            <input type="text" name="new_key" id="renameNewKey" class="shadow-sm focus:ring-blue-500 focus:border-blue-500 block w-full sm:text-sm border-slate-300 dark:border-slate-600 rounded-md p-2 border font-mono text-sm bg-white dark:bg-slate-700 text-slate-900 dark:text-white" required>
-                            <p class="text-xs text-slate-500 dark:text-slate-400 mt-2">Example: <code>folder/newname.jpg</code> or just <code>newname.jpg</code> to move to root.</p>
-                        </div>
-                        <div class="mt-5 sm:mt-6 sm:grid sm:grid-cols-2 sm:gap-3 sm:grid-flow-row-dense">
-                            <button type="submit" class="w-full inline-flex justify-center rounded-lg border border-transparent shadow-sm px-4 py-2 bg-orange-600 text-base font-medium text-white hover:bg-orange-700 focus:outline-none sm:col-start-2 sm:text-sm">
-                                Rename / Move
-                            </button>
-                            <button type="button" class="mt-3 w-full inline-flex justify-center rounded-lg border border-slate-300 dark:border-slate-600 shadow-sm px-4 py-2 bg-white dark:bg-slate-700 text-base font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-600 focus:outline-none sm:mt-0 sm:col-start-1 sm:text-sm" onclick="document.getElementById('renameModal').classList.add('hidden')">
-                                Cancel
-                            </button>
-                        </div>
-                    </form>
-                </div>
-            </div>
-        </div>
+<div id="ctxmenu"></div>
+<div id="toasts"></div>
+<div id="uploads"></div>
+
+<!-- Bucket ekleme modal -->
+<div class="modal-back" id="bucketModalBack">
+  <div class="modal">
+    <h3>Yeni Bucket Ekle</h3>
+    <label>Anahtar (key, benzersiz)</label><input id="b_key" placeholder="örnek: bucket3">
+    <label>Görünen İsim</label><input id="b_name" placeholder="Örnek Bucket">
+    <label>Access Key ID</label><input id="b_ak">
+    <label>Secret Access Key</label><input id="b_sk" type="password">
+    <label>Bucket Adı</label><input id="b_bn">
+    <label>Endpoint URL</label><input id="b_ep" placeholder="https://xxxx.r2.cloudflarestorage.com">
+    <label>Region</label><input id="b_region" value="auto">
+    <label>Public URL (opsiyonel)</label><input id="b_pub" placeholder="https://pub-xxx.r2.dev/">
+    <div class="row-btns">
+      <button class="btn" onclick="closeModal('bucketModalBack')">İptal</button>
+      <button class="btn primary" onclick="submitAddBucket()">Ekle</button>
     </div>
+  </div>
+</div>
 
-    <!-- Preview Modal -->
-    <div id="previewModal" class="hidden fixed inset-0 z-50 overflow-y-auto">
-        <div class="flex items-center justify-center min-h-screen px-4 pt-4 pb-20 text-center sm:block sm:p-0">
-            <div class="fixed inset-0 bg-slate-900 bg-opacity-90 transition-opacity" onclick="closePreview()"></div>
-            <span class="hidden sm:inline-block sm:align-middle sm:h-screen">&#8203;</span>
-            <div class="inline-block align-middle bg-transparent rounded-lg text-left overflow-hidden shadow-xl transform transition-all sm:max-w-4xl sm:w-full relative group">
-                
-                 <!-- Nav Buttons (Desktop) -->
-                 <button onclick="showPrevPreview()" class="absolute left-0 top-1/2 -translate-y-1/2 text-white/50 hover:text-white text-4xl p-4 hidden md:block z-50 focus:outline-none">
-                    <i class="fa-solid fa-chevron-left"></i>
-                 </button>
-                 <button onclick="showNextPreview()" class="absolute right-0 top-1/2 -translate-y-1/2 text-white/50 hover:text-white text-4xl p-4 hidden md:block z-50 focus:outline-none">
-                    <i class="fa-solid fa-chevron-right"></i>
-                 </button>
-
-                <div class="relative bg-white dark:bg-slate-800 rounded-lg overflow-hidden">
-                    <div class="flex justify-between items-center p-4 border-b border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-750">
-                        <h3 class="text-lg font-medium text-slate-900 dark:text-white truncate pr-4 flex-1" id="previewTitle">File Preview</h3>
-                        <div class="flex items-center space-x-2">
-                             <a href="#" id="previewOpenBtn" target="_blank" class="text-slate-400 hover:text-blue-600 px-3 py-1 rounded hover:bg-slate-100 dark:hover:bg-slate-700 transition-colors" title="Open in New Tab">
-                                <i class="fa-solid fa-arrow-up-right-from-square"></i>
-                            </a>
-                            <button type="button" onclick="deleteCurrentPreview()" class="text-slate-400 hover:text-red-500 px-3 py-1 rounded hover:bg-slate-100 dark:hover:bg-slate-700 transition-colors" title="Delete File">
-                                <i class="fa-regular fa-trash-can"></i>
-                            </button>
-                            <div class="w-px h-6 bg-slate-200 dark:bg-slate-600 mx-1"></div>
-                            <button type="button" class="text-slate-400 hover:text-slate-500 dark:hover:text-slate-300 focus:outline-none" onclick="closePreview()">
-                                <span class="sr-only">Close</span>
-                               <i class="fa-solid fa-xmark text-xl"></i>
-                            </button>
-                        </div>
-                    </div>
-                    <div class="p-4 bg-slate-100 dark:bg-slate-900 flex justify-center items-center min-h-[300px] max-h-[80vh] overflow-auto" id="previewContent">
-                        <!-- Content injected by JS -->
-                        <i class="fa-solid fa-circle-notch fa-spin text-4xl text-blue-500"></i>
-                    </div>
-                </div>
-            </div>
-        </div>
+<!-- Yeni klasör modal -->
+<div class="modal-back" id="folderModalBack">
+  <div class="modal">
+    <h3>Yeni Klasör</h3>
+    <label>Klasör Adı</label><input id="folderName">
+    <div class="row-btns">
+      <button class="btn" onclick="closeModal('folderModalBack')">İptal</button>
+      <button class="btn primary" onclick="submitNewFolder()">Oluştur</button>
     </div>
+  </div>
+</div>
 
-    <!-- New Folder Modal -->
-    <div id="newFolderModal" class="hidden fixed inset-0 z-50 overflow-y-auto">
-        <div class="flex items-end justify-center min-h-screen pt-4 px-4 pb-20 text-center sm:block sm:p-0">
-            <div class="fixed inset-0 bg-slate-900 bg-opacity-75" onclick="document.getElementById('newFolderModal').classList.add('hidden')"></div>
-            <span class="hidden sm:inline-block sm:align-middle sm:h-screen">&#8203;</span>
-            <div class="inline-block align-bottom bg-white dark:bg-slate-800 rounded-xl text-left overflow-hidden shadow-xl transform transition-all sm:my-8 sm:align-middle sm:max-w-lg sm:w-full">
-                <div class="bg-white dark:bg-slate-800 px-4 pt-5 pb-4 sm:p-6 sm:pb-4">
-                    <h3 class="text-lg leading-6 font-medium text-slate-900 dark:text-white mb-4">Create New Folder</h3>
-                    <form action="{{ url_for('mkdir') }}" method="POST">
-                        <input type="hidden" name="prefix" value="{{ prefix }}">
-                        <div class="mb-4">
-                            <label for="folderName" class="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-2">Folder Name</label>
-                            <input type="text" name="folder_name" id="folderName" class="shadow-sm focus:ring-blue-500 focus:border-blue-500 block w-full sm:text-sm border-slate-300 dark:border-slate-600 rounded-md p-2 border bg-white dark:bg-slate-700 text-slate-900 dark:text-white placeholder-slate-400" placeholder="e.g., images" required>
-                        </div>
-                        <div class="mt-5 sm:mt-6 sm:grid sm:grid-cols-2 sm:gap-3 sm:grid-flow-row-dense">
-                            <button type="submit" class="w-full inline-flex justify-center rounded-lg border border-transparent shadow-sm px-4 py-2 bg-blue-600 text-base font-medium text-white hover:bg-blue-700 focus:outline-none sm:col-start-2 sm:text-sm">
-                                Create
-                            </button>
-                            <button type="button" class="mt-3 w-full inline-flex justify-center rounded-lg border border-slate-300 dark:border-slate-600 shadow-sm px-4 py-2 bg-white dark:bg-slate-700 text-base font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-600 focus:outline-none sm:mt-0 sm:col-start-1 sm:text-sm" onclick="document.getElementById('newFolderModal').classList.add('hidden')">
-                                Cancel
-                            </button>
-                        </div>
-                    </form>
-                </div>
-            </div>
-        </div>
+<!-- Yeniden adlandırma modal -->
+<div class="modal-back" id="renameModalBack">
+  <div class="modal">
+    <h3>Yeniden Adlandır</h3>
+    <label>Yeni İsim</label><input id="renameInput">
+    <div class="row-btns">
+      <button class="btn" onclick="closeModal('renameModalBack')">İptal</button>
+      <button class="btn primary" onclick="submitRename()">Kaydet</button>
     </div>
+  </div>
+</div>
 
-    <!-- Toast Notification -->
-    <div id="toast" class="fixed bottom-4 right-4 bg-slate-800 text-white px-6 py-3 rounded-lg shadow-lg transform translate-y-20 opacity-0 transition-all duration-300 z-50">
-        <i class="fa-solid fa-circle-check text-green-400 mr-2"></i>
-        <span id="toastMessage">Notification</span>
+<!-- Taşıma modal -->
+<div class="modal-back" id="moveModalBack">
+  <div class="modal">
+    <h3>Taşı</h3>
+    <label>Hedef Bucket</label><select id="moveBucket"></select>
+    <label>Hedef Klasör (prefix)</label><input id="movePrefix" placeholder="örn: yedek/2026/">
+    <div class="row-btns">
+      <button class="btn" onclick="closeModal('moveModalBack')">İptal</button>
+      <button class="btn primary" onclick="submitMove()">Taşı</button>
     </div>
+  </div>
+</div>
 
-    <script>
-        const PREFIX = new URLSearchParams(window.location.search).get('prefix') || '';
-        let totalFiles = 0;
-        let uploadedFiles = 0;
-        let successfulUploadsCount = 0; // New tracker for reload decision
-        
-        // Concurrency Control
-        const MAX_CONCURRENT_UPLOADS = 3;
-        let activeUploads = 0;
-        let uploadQueue = [];
-        let isUploading = false; // Flag to check if start button pressed
+<!-- Link modal -->
+<div class="modal-back" id="linkModalBack">
+  <div class="modal">
+    <h3 id="linkModalTitle">Link</h3>
+    <label>Public Link</label>
+    <div class="link-row"><input id="publicLinkInput" readonly><button class="btn small" onclick="copyInput('publicLinkInput')">Kopyala</button></div>
+    <label>Signed Link Süresi</label>
+    <select id="signExpiry">
+      <option value="300">5 dakika</option>
+      <option value="3600" selected>1 saat</option>
+      <option value="86400">1 gün</option>
+      <option value="604800">7 gün</option>
+    </select>
+    <div class="link-row"><input id="signedLinkInput" readonly placeholder="Oluştur'a basın"><button class="btn small" onclick="generateSignedLink()">Oluştur</button></div>
+    <div class="row-btns">
+      <button class="btn" onclick="closeModal('linkModalBack')">Kapat</button>
+    </div>
+  </div>
+</div>
 
-        // --- INIT ---
-        function toggleBucketDropdown() {
-             const menu = document.getElementById('bucketMenu');
-             menu.classList.toggle('hidden');
-        }
-        
-        window.addEventListener('click', function(e) {
-            const container = document.getElementById('account-dropdown-container');
-            const menu = document.getElementById('bucketMenu');
-            if (container && !container.contains(e.target)) {
-                 if (menu && !menu.classList.contains('hidden')) {
-                    menu.classList.add('hidden');
-                 }
-            }
-        });
+<!-- Yükleme onay modal: isim değiştir / hedef klasör / var olanları atla -->
+<div class="modal-back" id="uploadConfirmBack">
+  <div class="modal" style="width:min(480px,92vw);">
+    <h3>Dosyaları Yükle</h3>
+    <label>Hedef Klasör</label><input id="uploadTargetPrefix">
+    <label>Dosyalar</label>
+    <div class="upload-list" id="uploadList"></div>
+    <div class="row-btns">
+      <button class="btn" onclick="cancelUploadConfirm()">İptal</button>
+      <button class="btn primary" onclick="confirmUpload()">Yükle</button>
+    </div>
+  </div>
+</div>
 
-        document.addEventListener('DOMContentLoaded', () => {
-             setupInfiniteScroll();
-             setupPaste();
-        });
+<!-- Önizleme modal -->
+<div class="modal-back" id="previewModal">
+  <div class="modal" style="width:min(900px,92vw);">
+    <h3 id="previewTitle">Önizleme</h3>
+    <div class="preview-wrap">
+      <button class="preview-nav prev" onclick="navigatePreview(-1)" title="Önceki">
+        <svg viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></svg>
+      </button>
+      <div class="previewBody" id="previewBody"></div>
+      <button class="preview-nav next" onclick="navigatePreview(1)" title="Sonraki">
+        <svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg>
+      </button>
+    </div>
+    <div class="row-btns">
+      <button class="btn small" onclick="copyPreviewPublicLink()">Kalıcı Link Kopyala</button>
+      <button class="btn small" onclick="copyPreviewSignedLink()">Geçici Link Kopyala (24s)</button>
+      <button class="btn small danger" onclick="deletePreviewFile()">Sil</button>
+      <button class="btn" onclick="closePreviewModal()">Kapat</button>
+    </div>
+  </div>
+</div>
 
-        // --- INFINITE SCROLL ---
-        function setupInfiniteScroll() {
-            const sentinel = document.getElementById('sentinel');
-            if (!sentinel) return;
+<script>
+// ---- Ince cizgili ikon seti (feather-benzeri) ----
+const ICONS = {
+  bucket: '<svg class="icon" viewBox="0 0 24 24"><path d="M4 6h16l-1.5 13a2 2 0 0 1-2 1.8H7.5a2 2 0 0 1-2-1.8L4 6z"/><path d="M4 6c0-1.5 3.6-2.5 8-2.5S20 4.5 20 6"/></svg>',
+  plus: '<svg class="icon" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>',
+  folder: '<svg class="icon" viewBox="0 0 24 24" style="stroke:none;fill:currentColor"><path d="M3 6.5A1.5 1.5 0 0 1 4.5 5h4.4c.4 0 .77.16 1.06.44L11.6 7H19.5A1.5 1.5 0 0 1 21 8.5v9A1.5 1.5 0 0 1 19.5 19h-15A1.5 1.5 0 0 1 3 17.5v-11z"/></svg>',
+  folderPlus: '<svg class="icon" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"/><path d="M12 11v4M10 13h4"/></svg>',
+  upload: '<svg class="icon" viewBox="0 0 24 24"><path d="M12 16V4M7 9l5-5 5 5"/><path d="M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/></svg>',
+  download: '<svg class="icon" viewBox="0 0 24 24"><path d="M12 4v12M7 11l5 5 5-5"/><path d="M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/></svg>',
+  eye: '<svg class="icon" viewBox="0 0 24 24"><path d="M1.5 12S5 5 12 5s10.5 7 10.5 7-3.5 7-10.5 7S1.5 12 1.5 12z"/><circle cx="12" cy="12" r="3"/></svg>',
+  link: '<svg class="icon" viewBox="0 0 24 24"><path d="M9 15l6-6"/><path d="M13 5.5l1.4-1.4a3.5 3.5 0 0 1 5 5L18 10.5"/><path d="M11 18.5L9.6 19.9a3.5 3.5 0 0 1-5-5L6 13.5"/></svg>',
+  edit: '<svg class="icon" viewBox="0 0 24 24"><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>',
+  move: '<svg class="icon" viewBox="0 0 24 24"><path d="M5 9l-3 3 3 3M19 9l3 3-3 3M9 5l3-3 3 3M9 19l3 3 3-3"/><path d="M2 12h20M12 2v20"/></svg>',
+  trash: '<svg class="icon" viewBox="0 0 24 24"><path d="M4 7h16M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2m3 0-1 13a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 7"/></svg>',
+  dots: '<svg class="icon" viewBox="0 0 24 24" style="stroke-width:2.4"><circle cx="12" cy="5" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="12" cy="19" r="1"/></svg>',
+  image: '<svg class="icon" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>',
+  video: '<svg class="icon" viewBox="0 0 24 24"><rect x="2" y="5" width="15" height="14" rx="2"/><path d="M22 8l-5 4 5 4V8z"/></svg>',
+  pdf: '<svg class="icon" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>',
+  archive: '<svg class="icon" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="17" rx="2"/><path d="M3 9h18M9 13h2"/></svg>',
+  audio: '<svg class="icon" viewBox="0 0 24 24"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>',
+  doc: '<svg class="icon" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M8 13h8M8 17h5"/></svg>',
+  sheet: '<svg class="icon" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M9 3v18"/></svg>',
+  file: '<svg class="icon" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>',
+  home: '<svg class="icon" viewBox="0 0 24 24"><path d="M3 11l9-8 9 8"/><path d="M5 10v10a1 1 0 0 0 1 1h4v-6h4v6h4a1 1 0 0 0 1-1V10"/></svg>',
+  warn: '<svg class="icon" viewBox="0 0 24 24" style="width:12px;height:12px;color:#d9a441"><path d="M12 9v4M12 17h.01"/><path d="M10.3 3.9L1.8 18a1.5 1.5 0 0 0 1.3 2.2h17.8a1.5 1.5 0 0 0 1.3-2.2L13.7 3.9a1.5 1.5 0 0 0-2.6 0z"/></svg>',
+  grid: '<svg class="icon" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>',
+  list: '<svg class="icon" viewBox="0 0 24 24"><path d="M8 6h13M8 12h13M8 18h13"/><path d="M3 6h.01M3 12h.01M3 18h.01"/></svg>',
+  check: '<svg viewBox="0 0 24 24" style="width:11px;height:11px" stroke="currentColor" stroke-width="3" fill="none" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>',
+};
 
-            const observer = new IntersectionObserver((entries) => {
-                if (entries[0].isIntersecting) {
-                    const nextToken = sentinel.dataset.nextToken;
-                    if (nextToken) {
-                        loadMoreFiles(nextToken);
-                    }
-                }
-            });
-            observer.observe(sentinel);
-        }
+let state = {
+  bucket: null, prefix: '', buckets: [], files: [], folders: [],
+  selected: new Set(), ctxTargetKey: null, ctxTargetIsFolder: false,
+  pendingUploads: [],
+};
 
-        async function loadMoreFiles(token) {
-            const sentinel = document.getElementById('sentinel');
-            const spinner = document.getElementById('loadingSpinner');
-            
-            // Prevent multiple triggers
-            if (sentinel.dataset.loading === 'true') return;
-            sentinel.dataset.loading = 'true';
+function showToast(msg, type='') {
+  const el = document.createElement('div');
+  el.className = 'toast ' + type;
+  el.textContent = msg;
+  document.getElementById('toasts').appendChild(el);
+  setTimeout(()=> el.remove(), 3500);
+}
 
-            try {
-                // Construct URL for next page
-                const url = new URL(window.location.href);
-                url.searchParams.set('continuation_token', token);
-                
-                const res = await fetch(url.toString());
-                const text = await res.text();
-                const parser = new DOMParser();
-                const doc = parser.parseFromString(text, 'text/html');
-                
-                // Extract new rows
-                const newRows = doc.querySelectorAll('tbody tr');
-                const tbody = document.querySelector('tbody');
-                newRows.forEach(row => tbody.appendChild(row));
-                
-                // Update Token
-                const newSentinel = doc.getElementById('sentinel');
-                const newNextToken = newSentinel ? newSentinel.dataset.nextToken : null;
-                
-                if (newNextToken) {
-                    sentinel.dataset.nextToken = newNextToken;
-                    sentinel.dataset.loading = 'false';
-                } else {
-                    sentinel.removeAttribute('data-next-token');
-                    sentinel.innerHTML = '<span class="text-xs text-slate-300">End of list</span>';
-                    // Stop observing
-                }
+function closeModal(id){ document.getElementById(id).style.display='none'; }
+function openModalEl(id){ document.getElementById(id).style.display='flex'; }
 
-            } catch (err) {
-                console.error("Scroll failed", err);
-                sentinel.dataset.loading = 'false';
-                 // Retry logic could go here
-            }
-        }
+// Herhangi bir modalin arkaplanina (disina) tiklaninca kapat
+document.querySelectorAll('.modal-back').forEach(back=>{
+  back.addEventListener('mousedown', (e)=>{
+    if (e.target !== back) return;
+    if (back.id === 'previewModal') closePreviewModal();
+    else back.style.display = 'none';
+  });
+});
 
-        // --- PASTE SUPPORT ---
-        function setupPaste() {
-            document.addEventListener('paste', (e) => {
-                const items = e.clipboardData.items;
-                const fileList = [];
-                
-                for (let i = 0; i < items.length; i++) {
-                   if (items[i].kind === 'file') {
-                       const file = items[i].getAsFile();
-                       if (file) fileList.push(file);
-                   }
-                }
-                
-                if (fileList.length > 0) {
-                    // Open modal if not open? Or just queue if open?
-                    // Let's open modal and start
-                     document.getElementById('uploadModal').classList.remove('hidden');
-                     
-                     // Mock input-like object
-                     const mockInput = { files: fileList };
-                     filesSelected(mockInput);
-                }
-            });
-        }
+async function api(url, opts) {
+  const res = await fetch(url, opts);
+  let data;
+  try { data = await res.json(); } catch(e){ data = {}; }
+  if (!res.ok || data.error) { showToast(data.error || 'Hata oluştu', 'error'); throw new Error(data.error||'error'); }
+  return data;
+}
 
-        function setupUpload(type) {
-            const title = document.getElementById('uploadModalTitle');
-            const input = document.getElementById('fileInput');
-            const dropText = document.getElementById('dropText');
-            
-            // Reset state
-            activeUploads = 0;
-            uploadQueue = [];
-            isUploading = false;
-            totalFiles = 0;
-            uploadedFiles = 0;
-            successfulUploadsCount = 0;
-            
-            document.getElementById('uploadUi').classList.remove('hidden');
-            document.getElementById('progressContainer').classList.add('hidden');
-            document.getElementById('progressContainer').innerHTML = ''; // Clear items
-            document.getElementById('totalProgress').classList.add('hidden');
-            document.getElementById('startUploadBtn').classList.add('hidden');
-            document.getElementById('closeBtn').classList.remove('bg-green-600', 'text-white', 'hover:bg-green-700');
-            document.getElementById('closeBtn').classList.add('bg-white', 'text-slate-700', 'border-slate-300');
-            document.getElementById('closeBtn').textContent = "Close";
-            
-            document.getElementById('targetPathInput').value = PREFIX;
-            
-            const newInput = input.cloneNode(true);
-            input.parentNode.replaceChild(newInput, input);
-            newInput.addEventListener('change', function() { filesSelected(this); });
-            
-            if (type === 'folder') {
-                title.textContent = 'Upload Folder';
-                dropText.textContent = 'Drag & Drop a Folder here';
-                newInput.setAttribute('webkitdirectory', '');
-                newInput.setAttribute('directory', '');
-            } else {
-                title.textContent = 'Upload Files';
-                dropText.textContent = 'Drag & Drop Files here or Paste (Ctrl+V)';
-                newInput.removeAttribute('webkitdirectory');
-                newInput.removeAttribute('directory');
-            }
-            
-            document.getElementById('uploadModal').classList.remove('hidden');
-        }
+async function loadBuckets() {
+  const data = await api('/api/buckets');
+  state.buckets = data.buckets;
+  state.bucket = localStorage.getItem('s3m_bucket') || data.default;
+  if (!state.buckets.find(b=>b.key===state.bucket)) state.bucket = data.default;
+  const sel = document.getElementById('bucketSelect');
+  sel.innerHTML = '';
+  data.buckets.forEach(b=>{
+    const o = document.createElement('option');
+    o.value = b.key; o.textContent = b.name;
+    sel.appendChild(o);
+  });
+  sel.value = state.bucket;
+  sel.onchange = () => { state.bucket = sel.value; localStorage.setItem('s3m_bucket', state.bucket); state.prefix=''; refresh(); loadBucketStats(); };
+  refreshMoveBucketOptions();
+}
 
-        async function filesSelected(input) {
-            if (!input.files || input.files.length === 0) return;
-            
-            const files = Array.from(input.files);
-            
-            document.getElementById('uploadUi').classList.add('hidden');
-            document.getElementById('totalProgress').classList.remove('hidden'); 
-            document.getElementById('progressContainer').classList.remove('hidden');
-            document.getElementById('startUploadBtn').classList.remove('hidden'); // Show START
-            
-            // Add to queue
-            const container = document.getElementById('progressContainer');
-            
-            for (let i = 0; i < files.length; i++) {
-                const file = files[i];
-                const id = 'prog-' + Date.now() + '-' + i;
-                
-                // Track total
-                totalFiles++;
-                
-                const el = document.createElement('div');
-                el.id = 'el-' + id;
-                el.innerHTML = `
-                    <div class="text-xs text-slate-500 flex justify-between mb-1 items-center">
-                        <div class="truncate w-3/4 font-mono flex items-center">
-                            <span class="mr-2 cursor-pointer text-red-400 hover:text-red-600 remove-btn" onclick="removeFromQueue('${id}')"><i class="fa-solid fa-xmark"></i></span>
-                            ${file.name}
-                        </div>
-                        <div class="text-right">
-                             <span id="${id}-speed" class="text-slate-300 mr-2 text-[10px]"></span>
-                             <span id="${id}-pct">Pending</span>
-                        </div>
-                    </div>
-                    <div class="w-full bg-slate-200 rounded-full h-2">
-                        <div id="${id}-bar" class="bg-slate-300 h-2 rounded-full transition-all duration-300" style="width: 0%"></div>
-                    </div>
-                `;
-                container.appendChild(el);
-                
-                uploadQueue.push({ 
-                    file, 
-                    id, 
-                    retries: 0,
-                    lastLoaded: 0,
-                    lastTime: Date.now()
-                });
-            }
-            
-            updateTotalProgress();
-        }
-        
-        function removeFromQueue(id) {
-            if (isUploading) return; 
-            
-            const idx = uploadQueue.findIndex(item => item.id === id);
-            if (idx > -1) {
-                uploadQueue.splice(idx, 1);
-                document.getElementById('el-' + id).remove();
-                totalFiles--;
-                updateTotalProgress();
-                
-                if (totalFiles === 0) {
-                     // Reset UI if empty
-                     document.getElementById('uploadUi').classList.remove('hidden');
-                     document.getElementById('totalProgress').classList.add('hidden');
-                     document.getElementById('startUploadBtn').classList.add('hidden');
-                }
-            }
-        }
-        
-        function startUpload() {
-            if (uploadQueue.length === 0) return;
-            
-            isUploading = true;
-            document.getElementById('startUploadBtn').classList.add('hidden');
-            
-            // Hide remove buttons
-            const removeBtns = document.querySelectorAll('.remove-btn');
-            removeBtns.forEach(el => el.style.display = 'none');
-            
-            processQueue();
-        }
-        
-        function updateTotalProgress() {
-            // Prevent NaN
-            const pct = totalFiles > 0 ? Math.round((uploadedFiles / totalFiles) * 100) : 0;
-            const bar = document.getElementById('totalBar');
-            const text = document.getElementById('totalText');
-            const pctText = document.getElementById('totalPercent');
-            
-            // Cap at 100% just in case
-            const displayPct = Math.min(pct, 100);
-            
-            bar.style.width = displayPct + '%';
-            text.textContent = `Uploaded ${uploadedFiles} of ${totalFiles} files`;
-            pctText.textContent = displayPct + '%';
-            
-            if (uploadedFiles >= totalFiles && totalFiles > 0 && isUploading) {
-                bar.classList.add('bg-green-500');
-            } else {
-                 bar.classList.remove('bg-green-500');
-            }
-        }
+function refreshMoveBucketOptions() {
+  const sel = document.getElementById('moveBucket');
+  sel.innerHTML = '';
+  state.buckets.forEach(b=>{
+    const o = document.createElement('option'); o.value=b.key; o.textContent=b.name; sel.appendChild(o);
+  });
+}
 
-        function processQueue() {
-            // Keep going as long as we have concurrency slots and items
-            while (activeUploads < MAX_CONCURRENT_UPLOADS && uploadQueue.length > 0) {
-                const item = uploadQueue.shift();
-                activeUploads++;
-                uploadFile(item);
-            }
-            
-            if (uploadQueue.length === 0 && activeUploads === 0 && isUploading) {
-                checkAllDone();
-            }
-        }
+function renderBreadcrumb() {
+  const bc = document.getElementById('breadcrumb');
+  bc.innerHTML = '';
+  const rootSpan = document.createElement('span');
+  rootSpan.innerHTML = ICONS.home + ' kök';
+  rootSpan.onclick = () => { state.prefix=''; refresh(); };
+  bc.appendChild(rootSpan);
+  if (!state.prefix) return;
+  const parts = state.prefix.split('/').filter(Boolean);
+  let acc = '';
+  parts.forEach(p=>{
+    const sep = document.createElement('span'); sep.className='sep'; sep.textContent='/'; bc.appendChild(sep);
+    acc += p + '/';
+    const s = document.createElement('span'); s.textContent = p;
+    const target = acc;
+    s.onclick = () => { state.prefix = target; refresh(); };
+    bc.appendChild(s);
+  });
+}
 
-        async function uploadFile(item) {
-            const { file, id } = item;
-            const bar = document.getElementById(id + '-bar');
-            const pct = document.getElementById(id + '-pct');
-            const speedEl = document.getElementById(id + '-speed');
-            
-            // Read TARGET PATH from input
-            let targetPrefix = document.getElementById('targetPathInput').value.trim();
-            if (targetPrefix && !targetPrefix.endsWith('/')) targetPrefix += '/';
-            if (targetPrefix.startsWith('/')) targetPrefix = targetPrefix.substring(1);
-            
-            bar.classList.remove('bg-slate-300');
-            bar.classList.add('bg-blue-600');
-            pct.textContent = 'Starting...';
+function extOf(name){ const i=name.lastIndexOf('.'); return i>=0?name.slice(i+1).toLowerCase():''; }
+function isImage(ext){ return ['jpg','jpeg','png','gif','webp','svg','bmp','avif'].includes(ext); }
+function isVideo(ext){ return ['mp4','webm','mov','mkv','avi'].includes(ext); }
+function isPdf(ext){ return ext==='pdf'; }
+function fmtSize(b){
+  if (b<1024) return b+' B';
+  if (b<1024*1024) return (b/1024).toFixed(1)+' KB';
+  if (b<1024*1024*1024) return (b/1024/1024).toFixed(1)+' MB';
+  return (b/1024/1024/1024).toFixed(2)+' GB';
+}
 
-            let filename = file.name;
-            if (file.webkitRelativePath) {
-                filename = file.webkitRelativePath;
-            }
-            
-            try {
-                // 1. Get Presigned URL
-                const res = await fetch('/get_upload_link', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ 
-                        filename: filename,
-                        prefix: targetPrefix 
-                    })
-                });
-                
-                if (res.status === 409) {
-                     activeUploads--;
-                     uploadedFiles++; 
-                     
-                     bar.classList.remove('bg-blue-600');
-                     bar.classList.add('bg-yellow-400');
-                     bar.style.width = '100%';
-                     pct.innerHTML = '<span class="text-yellow-600 font-bold">Skipped</span>';
-                     speedEl.textContent = '';
-                     
-                     updateTotalProgress();
-                     processQueue();
-                     return;
-                }
-                
-                if (!res.ok) throw new Error('Sign fail');
-                const data = await res.json();
-                
-                // 2. Direct PUT to S3
-                const xhr = new XMLHttpRequest();
-                xhr.open('PUT', data.url, true);
-                xhr.setRequestHeader('Content-Type', data.content_type);
-                
-                xhr.upload.onprogress = (e) => {
-                    if (e.lengthComputable) {
-                        const now = Date.now();
-                        const timeDiff = (now - item.lastTime) / 1000; // seconds
-                        
-                        if (timeDiff >= 0.5) { // Update speed every 0.5s
-                            const loadedDiff = e.loaded - item.lastLoaded;
-                            const speedBytes = loadedDiff / timeDiff;
-                            const speedMB = (speedBytes / (1024 * 1024)).toFixed(1);
-                            
-                            speedEl.textContent = `${speedMB} MB/s`;
-                            
-                            item.lastLoaded = e.loaded;
-                            item.lastTime = now;
-                        }
+state.bucketStatsCache = {};
+async function loadBucketStats(force){
+  const el = document.getElementById('bucketStats');
+  const bucket = state.bucket;
+  if (!force && state.bucketStatsCache[bucket]) {
+    renderBucketStats(state.bucketStatsCache[bucket]);
+    return;
+  }
+  el.textContent = 'Hesaplanıyor...';
+  try {
+    const data = await api(`/api/bucket-stats?bucket=${bucket}`);
+    state.bucketStatsCache[bucket] = data;
+    if (state.bucket === bucket) renderBucketStats(data);
+  } catch (e) {
+    if (state.bucket === bucket) el.textContent = '';
+  }
+}
+function renderBucketStats(data){
+  const el = document.getElementById('bucketStats');
+  el.textContent = `${data.count.toLocaleString('tr-TR')} dosya · ${fmtSize(data.total_size)}${data.partial ? ' (kısmi)' : ''}`;
+}
+document.getElementById('bucketStats').onclick = () => loadBucketStats(true);
+function wrapIcon(svg, color){
+  return `<span style="color:${color};display:flex;">${svg}</span>`;
+}
+function iconFor(ext){
+  if (isImage(ext)) return wrapIcon(ICONS.image, '#4fa3ff');
+  if (isVideo(ext)) return wrapIcon(ICONS.video, '#f472b6');
+  if (isPdf(ext)) return wrapIcon(ICONS.pdf, '#f87171');
+  if (['zip','rar','7z','tar','gz'].includes(ext)) return wrapIcon(ICONS.archive, '#fb923c');
+  if (['mp3','wav','flac','ogg'].includes(ext)) return wrapIcon(ICONS.audio, '#2dd4bf');
+  if (['doc','docx'].includes(ext)) return wrapIcon(ICONS.doc, '#818cf8');
+  if (['xls','xlsx','csv'].includes(ext)) return wrapIcon(ICONS.sheet, '#4ade80');
+  return wrapIcon(ICONS.file, 'var(--muted)');
+}
 
-                        const percent = Math.round((e.loaded / e.total) * 100);
-                        bar.style.width = percent + '%';
-                        pct.textContent = percent + '%';
-                    }
-                };
-                
-                xhr.onload = () => {
-                    activeUploads--;
-                    if (xhr.status === 200) {
-                        bar.classList.add('bg-green-500');
-                        bar.classList.remove('bg-blue-600');
-                        pct.innerHTML = '<i class="fa-solid fa-check text-green-500"></i>';
-                        speedEl.textContent = '';
-                        
-                        // Increment counts ONLY ON SUCCESS
-                        uploadedFiles++;
-                        successfulUploadsCount++;
-                        updateTotalProgress();
-                        processQueue(); 
-                    } else {
-                        handleError(item, 'HTTP ' + xhr.status);
-                    }
-                };
-                
-                xhr.onerror = () => {
-                     activeUploads--;
-                     handleError(item, 'Net Err');
-                };
-                
-                xhr.send(file);
-                
-            } catch (err) {
-                activeUploads--;
-                handleError(item, 'Fail');
-            }
-        }
+async function refresh() {
+  renderBreadcrumb();
+  const data = await api(`/api/list?bucket=${state.bucket}&prefix=${encodeURIComponent(state.prefix)}`);
+  state.folders = data.folders; state.files = data.files;
+  state.nextToken = data.next_token || null;
+  state.selected.clear();
+  renderGrid();
+  updateSelectionBar();
+  updateLoadMoreBtn();
+}
 
-        function handleError(item, msg) {
-            const { id, retries } = item;
-            const bar = document.getElementById(id + '-bar');
-            const pct = document.getElementById(id + '-pct');
-             const speedEl = document.getElementById(id + '-speed');
-             speedEl.textContent = '';
+async function loadMore(){
+  if (!state.nextToken || state.loadingMore) return;
+  state.loadingMore = true;
+  const btn = document.getElementById('loadMoreBtn');
+  const oldLabel = btn.textContent;
+  btn.textContent = 'Yükleniyor...'; btn.disabled = true;
+  try {
+    const data = await api(`/api/list?bucket=${state.bucket}&prefix=${encodeURIComponent(state.prefix)}&token=${encodeURIComponent(state.nextToken)}`);
+    state.folders = state.folders.concat(data.folders);
+    state.files = state.files.concat(data.files);
+    state.nextToken = data.next_token || null;
+    renderGrid(document.getElementById('searchBox').value);
+  } finally {
+    state.loadingMore = false;
+    btn.textContent = oldLabel; btn.disabled = false;
+    updateLoadMoreBtn();
+  }
+}
 
-            if (retries < 3) {
-                pct.textContent = `Retry ${retries+1}...`;
-                // Reset stats for retry
-                item.retries++;
-                item.lastLoaded = 0;
-                item.lastTime = Date.now();
-                
-                uploadQueue.unshift(item); 
-                setTimeout(() => {
-                    processQueue(); 
-                }, 1000);
-            } else {
-                bar.classList.remove('bg-blue-600');
-                bar.classList.add('bg-red-500');
-                pct.textContent = msg;
-                // DO NOT increment uploadedFiles here. 
-                // But we should "processQueue" to not stall others.
-                // Should we mark "totalFiles" down? 
-                // Or denote failure count? For now just keep totals but progress won't reach 100%
-                processQueue();
-            }
-        }
+function updateLoadMoreBtn(){
+  document.getElementById('loadMoreWrap').style.display = state.nextToken ? 'flex' : 'none';
+}
 
-        function checkAllDone() {
-            if (activeUploads === 0 && uploadQueue.length === 0) {
-                 if (uploadedFiles === totalFiles) {
-                    document.getElementById('closeBtn').innerHTML = "All Done - Refresh Page";
-                    document.getElementById('closeBtn').classList.add('bg-green-600', 'text-white', 'hover:bg-green-700');
-                } else {
-                     document.getElementById('closeBtn').innerHTML = "Completed with Errors";
-                }
-            }
-        }
-        
-        function handleModalClose() {
-             // If we did uploads, reload to show them.
-             if (successfulUploadsCount > 0) {
-                 location.reload();
-             } else {
-                 document.getElementById('uploadModal').classList.add('hidden');
-                 // Reset UI for next time?
-                 document.getElementById('uploadUi').classList.remove('hidden');
-                 document.getElementById('totalProgress').classList.add('hidden');
-                 document.getElementById('progressContainer').classList.add('hidden');
-             }
-        }
-        
-        // --- NEW FEATURES ---
+function sortFiles(files){
+  const mode = state.sortBy || 'name_asc';
+  const sorted = files.slice();
+  sorted.sort((a, b) => {
+    switch (mode) {
+      case 'name_desc': return b.name.localeCompare(a.name, 'tr');
+      case 'size_asc': return a.size - b.size;
+      case 'size_desc': return b.size - a.size;
+      case 'date_asc': return a.last_modified.localeCompare(b.last_modified);
+      case 'date_desc': return b.last_modified.localeCompare(a.last_modified);
+      case 'name_asc':
+      default: return a.name.localeCompare(b.name, 'tr');
+    }
+  });
+  return sorted;
+}
 
-        function openRenameModal(key) {
-            document.getElementById('renameModal').classList.remove('hidden');
-            document.getElementById('renameOldKey').value = key;
-            document.getElementById('renameNewKey').value = key; // Pre-fill
-        }
+function renderGrid(filterText='') {
+  const grid = document.getElementById('grid');
+  grid.innerHTML = '';
+  const ft = filterText.toLowerCase();
 
-        async function openInNewTab(key) {
-             try {
-                const response = await fetch(`/get_link?key=${encodeURIComponent(key)}`);
-                const data = await response.json();
-                if (data.url) {
-                    window.open(data.url, '_blank');
-                } else {
-                    showToast('Failed to get link', true);
-                }
-            } catch (err) {
-                showToast('Error opening file', true);
-            }
-        }
+  const foldersSorted = state.folders.slice().sort((a,b)=>a.name.localeCompare(b.name,'tr'));
+  foldersSorted.filter(f=>f.name.toLowerCase().includes(ft)).forEach(f=>{
+    const div = document.createElement('div');
+    div.className = 'item';
+    div.innerHTML = `<div class="thumb" style="color:#eab308">${ICONS.folder}</div><div class="name">${f.name}</div><div class="meta">klasör</div>
+      <button class="menu-btn" onclick="event.stopPropagation();openCtx(event,'${f.prefix}',true)">${ICONS.dots}</button>`;
+    div.ondblclick = () => { state.prefix = f.prefix; refresh(); };
+    div.oncontextmenu = (e)=>{ e.preventDefault(); openCtx(e, f.prefix, true); };
+    grid.appendChild(div);
+  });
 
-        // --- PREVIEW NAVIGATION ---
-        let previewFilesList = [];
-        let currentPreviewIndex = -1;
-        let currentPreviewKey = null; // Track current key for actions
-        let touchStartX = 0;
-        let touchEndX = 0;
+  const filesSorted = sortFiles(state.files).filter(f=>f.name.toLowerCase().includes(ft));
+  filesSorted.forEach(f=>{
+    const ext = extOf(f.name);
+    const div = document.createElement('div');
+    div.className = 'item' + (state.selected.has(f.key)?' selected':'');
+    const extBadge = ext ? `<span class="ext-badge">${ext.slice(0,4).toUpperCase()}</span>` : '';
+    div.innerHTML = `<button class="select-btn" onclick="event.stopPropagation();toggleSelect('${f.key}', this.closest('.item'))">${ICONS.check}</button>
+      <div class="thumb">${iconFor(ext)}${extBadge}</div><div class="name">${f.name}</div>
+      <div class="meta">${fmtSize(f.size)} · ${f.last_modified}</div>
+      <button class="menu-btn" onclick="event.stopPropagation();openCtx(event,'${f.key}',false)">${ICONS.dots}</button>`;
+    div.onclick = (e) => {
+      if (e.ctrlKey || e.metaKey || e.shiftKey) { toggleSelect(f.key, div); }
+      else { openPreview(f); }
+    };
+    div.oncontextmenu = (e)=>{ e.preventDefault(); openCtx(e, f.key, false); };
+    grid.appendChild(div);
+  });
+}
 
-        document.addEventListener('keydown', (e) => {
-            if (document.getElementById('previewModal').classList.contains('hidden')) return;
-            
-            if (e.key === 'ArrowLeft') showPrevPreview();
-            if (e.key === 'ArrowRight') showNextPreview();
-            if (e.key === 'Escape') closePreview();
-        });
-        
-        const previewModal = document.getElementById('previewModal');
-        previewModal.addEventListener('touchstart', e => {
-            touchStartX = e.changedTouches[0].screenX;
-        });
-        
-        previewModal.addEventListener('touchend', e => {
-            touchEndX = e.changedTouches[0].screenX;
-            handleSwipe();
-        });
-        
-        function handleSwipe() {
-            if (touchEndX < touchStartX - 50) showNextPreview();
-            if (touchEndX > touchStartX + 50) showPrevPreview();
-        }
+function toggleSelect(key, div) {
+  if (state.selected.has(key)) { state.selected.delete(key); div.classList.remove('selected'); }
+  else { state.selected.add(key); div.classList.add('selected'); }
+  updateSelectionBar();
+}
+function clearSelection(){ state.selected.clear(); renderGrid(document.getElementById('searchBox').value); updateSelectionBar(); }
+function updateSelectionBar(){
+  const bar = document.getElementById('selectionBar');
+  if (state.selected.size>0) { bar.style.display='flex'; document.getElementById('selCount').textContent = state.selected.size+' seçildi'; }
+  else bar.style.display='none';
+}
 
-        function refreshPreviewList() {
-            // Collect all viewable files currently in the DOM
-            // We look for button onclick="openPreview(...)"
-            const btns = document.querySelectorAll('button[onclick^="openPreview"]');
-            previewFilesList = [];
-            btns.forEach((btn, index) => {
-                // Parse the onclick attribute to get key and name
-                // onclick="openPreview('key', 'name')"
-                const match = btn.getAttribute('onclick').match(/openPreview\('([^']*)', '([^']*)'\)/);
-                if (match) {
-                    previewFilesList.push({
-                        key: match[1],
-                        name: match[2],
-                        index: index
-                    });
-                }
-            });
-        }
+async function deleteSelected(){
+  if (!confirm(`${state.selected.size} öge silinsin mi?`)) return;
+  await api('/api/delete', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({bucket: state.bucket, keys:[...state.selected]})});
+  showToast('Silindi', 'success');
+  refresh();
+}
+function copySelectedLinks(){
+  const links = state.files.filter(f=>state.selected.has(f.key) && f.public_url).map(f=>f.public_url);
+  navigator.clipboard.writeText(links.join('\n'));
+  showToast('Linkler kopyalandı', 'success');
+}
+function openMoveModal(){
+  refreshMoveBucketOptions();
+  document.getElementById('movePrefix').value = '';
+  openModalEl('moveModalBack');
+}
+async function submitMove(){
+  const dstBucket = document.getElementById('moveBucket').value;
+  const dstPrefix = document.getElementById('movePrefix').value;
+  const keys = state.ctxTargetKey ? [state.ctxTargetKey] : [...state.selected];
+  for (const k of keys) {
+    await api('/api/move', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({src_bucket: state.bucket, dst_bucket: dstBucket, src_key: k, dst_prefix: dstPrefix})});
+  }
+  showToast('Taşındı', 'success');
+  closeModal('moveModalBack');
+  state.ctxTargetKey = null;
+  refresh();
+}
 
-        async function openPreview(key, name) {
-            refreshPreviewList();
-            
-            // Find current index
-            currentPreviewIndex = previewFilesList.findIndex(f => f.key === key);
-            
-            await loadPreviewContent(key, name);
-            document.getElementById('previewModal').classList.remove('hidden');
-        }
-        
-        function showNextPreview() {
-            if (currentPreviewIndex === -1 || previewFilesList.length === 0) return;
-            currentPreviewIndex = (currentPreviewIndex + 1) % previewFilesList.length;
-            const item = previewFilesList[currentPreviewIndex];
-            loadPreviewContent(item.key, item.name);
-        }
+// ---- Context menu ----
+function openCtx(e, key, isFolder) {
+  e.preventDefault();
+  state.ctxTargetKey = key; state.ctxTargetIsFolder = isFolder;
+  const menu = document.getElementById('ctxmenu');
+  let html = '';
+  if (!isFolder) {
+    html += `<button onclick="ctxPreview()">${ICONS.eye} Önizle</button>`;
+    html += `<button onclick="ctxLinks()">${ICONS.link} Link Oluştur</button>`;
+    html += `<button onclick="ctxDownload()">${ICONS.download} İndir</button>`;
+  }
+  html += `<button onclick="ctxRename()">${ICONS.edit} Yeniden Adlandır</button>`;
+  html += `<button onclick="ctxMove()">${ICONS.move} Taşı</button>`;
+  html += `<hr>`;
+  html += `<button class="danger" onclick="ctxDelete()">${ICONS.trash} Sil</button>`;
+  menu.innerHTML = html;
+  menu.style.display = 'block';
+  const x = Math.min(e.clientX, window.innerWidth-190);
+  const y = Math.min(e.clientY, window.innerHeight-200);
+  menu.style.left = x+'px'; menu.style.top = y+'px';
+}
+document.addEventListener('click', ()=>{ document.getElementById('ctxmenu').style.display='none'; });
 
-        function showPrevPreview() {
-            if (currentPreviewIndex === -1 || previewFilesList.length === 0) return;
-            currentPreviewIndex = (currentPreviewIndex - 1 + previewFilesList.length) % previewFilesList.length;
-            const item = previewFilesList[currentPreviewIndex];
-            loadPreviewContent(item.key, item.name);
-        }
-        
-        async function loadPreviewContent(key, name) {
-            currentPreviewKey = key;
-            document.getElementById('previewTitle').textContent = name;
-            const content = document.getElementById('previewContent');
-            const openBtn = document.getElementById('previewOpenBtn');
-            
-            content.innerHTML = '<i class="fa-solid fa-circle-notch fa-spin text-4xl text-blue-500"></i>';
-            openBtn.href = '#'; // Reset
-            
-            try {
-                // Request SIGNED link for preview (default behavior now)
-                const response = await fetch(`/get_link?key=${encodeURIComponent(key)}`);
-                const data = await response.json();
-                
-                if (data.url) {
-                    openBtn.href = data.url; // Set open button link
-                    
-                    const ext = name.split('.').pop().toLowerCase();
-                    if (['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg'].includes(ext)) {
-                        content.innerHTML = `<img src="${data.url}" class="max-w-full max-h-[70vh] rounded shadow-lg select-none" draggable="false">`;
-                    } else if (['mp4', 'webm', 'mov'].includes(ext)) {
-                        content.innerHTML = `<video src="${data.url}" controls autoplay class="max-w-full max-h-[70vh] rounded shadow-lg"></video>`;
-                    } else if (ext === 'pdf') {
-                        content.innerHTML = `<iframe src="${data.url}" class="w-full h-[70vh] rounded border border-slate-200"></iframe>`;
-                    } else {
-                         content.innerHTML = `
-                            <div class="text-center">
-                                <i class="fa-regular fa-file text-6xl text-slate-300 mb-4 block"></i>
-                                <p class="text-slate-500 mb-4">No preview available.</p>
-                                <a href="${data.url}" target="_blank" class="text-blue-600 hover:underline">Download / Open</a>
-                            </div>
-                        `;
-                    }
-                } else {
-                    content.innerHTML = '<p class="text-red-500">Error loading link.</p>';
-                }
-            } catch (err) {
-                content.innerHTML = '<p class="text-red-500">Error loading preview.</p>';
-            }
-        }
-        
-        function closePreview() {
-            document.getElementById('previewModal').classList.add('hidden');
-            document.getElementById('previewContent').innerHTML = ''; 
-            currentPreviewKey = null;
-        }
+function ctxPreview(){ const f = state.files.find(f=>f.key===state.ctxTargetKey); if (f) openPreview(f); }
+function ctxDownload(){ generateSignedUrlAndGo(state.ctxTargetKey); }
+async function generateSignedUrlAndGo(key){
+  const data = await api(`/api/presign?bucket=${state.bucket}&key=${encodeURIComponent(key)}&expires=3600`);
+  window.open(data.url, '_blank');
+}
+function ctxLinks(){
+  document.getElementById('linkModalTitle').textContent = state.ctxTargetKey.split('/').pop();
+  document.getElementById('signedLinkInput').value = '';
+  api(`/api/public-url?bucket=${state.bucket}&key=${encodeURIComponent(state.ctxTargetKey)}`)
+    .then(d=> document.getElementById('publicLinkInput').value = d.url)
+    .catch(()=> document.getElementById('publicLinkInput').value = '(public url tanımlı değil)');
+  openModalEl('linkModalBack');
+}
+async function generateSignedLink(){
+  const expires = document.getElementById('signExpiry').value;
+  const data = await api(`/api/presign?bucket=${state.bucket}&key=${encodeURIComponent(state.ctxTargetKey)}&expires=${expires}`);
+  document.getElementById('signedLinkInput').value = data.url;
+}
+function copyInput(id){ const el = document.getElementById(id); el.select(); navigator.clipboard.writeText(el.value); showToast('Kopyalandı','success'); }
 
-        async function deleteCurrentPreview() {
-            if (!currentPreviewKey) return;
-            if (!confirm('Are you sure you want to delete this file?')) return;
-            
-            const formData = new FormData();
-            formData.append('key', currentPreviewKey);
-            
-            try {
-                const res = await fetch('/delete', {
-                    method: 'POST',
-                    body: formData
-                });
-                
-                if (res.ok) {
-                    window.location.reload();
-                } else {
-                    alert('Failed to delete file');
-                }
-            } catch (e) {
-                alert('Error deleting file');
-            }
-        }
+function ctxRename(){
+  const current = state.ctxTargetIsFolder ? state.ctxTargetKey.replace(/\/$/,'').split('/').pop() : state.ctxTargetKey.split('/').pop();
+  document.getElementById('renameInput').value = current;
+  openModalEl('renameModalBack');
+}
+async function submitRename(){
+  const newName = document.getElementById('renameInput').value.trim();
+  if (!newName) return;
+  await api('/api/rename', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({bucket: state.bucket, key: state.ctxTargetKey, new_name: newName})});
+  showToast('Yeniden adlandırıldı', 'success');
+  closeModal('renameModalBack');
+  refresh();
+}
+function ctxMove(){ openMoveModal(); }
+async function ctxDelete(){
+  if (!confirm('Silinsin mi?')) return;
+  await api('/api/delete', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({bucket: state.bucket, keys:[state.ctxTargetKey]})});
+  showToast('Silindi', 'success');
+  refresh();
+}
 
-        // Feature: Copy Link
-        async function copyLink(key) {
-            try {
-                // EXPLICITLY ask for public link
-                const response = await fetch(`/get_link?key=${encodeURIComponent(key)}&public=true`);
-                const data = await response.json();
-                
-                if (data.url) {
-                    await navigator.clipboard.writeText(data.url);
-                    showToast('Link copied to clipboard!');
-                } else {
-                    showToast('Failed to generate link', true);
-                }
-            } catch (err) {
-                console.error(err);
-                showToast('Error copying link', true);
-            }
-        }
+// ---- Onizleme ----
+function getVisibleFiles(){
+  const ft = document.getElementById('searchBox').value.toLowerCase();
+  return state.files.filter(f=>f.name.toLowerCase().includes(ft));
+}
 
-        function showToast(message, isError = false) {
-            const toast = document.getElementById('toast');
-            document.getElementById('toastMessage').textContent = message;
-            
-            if (isError) {
-                toast.classList.add('bg-red-800');
-            } else {
-                toast.classList.remove('bg-red-800');
-            }
+function openPreview(f){
+  const visible = getVisibleFiles();
+  state.previewIndex = visible.findIndex(x=>x.key===f.key);
+  renderPreview(f);
+  openModalEl('previewModal');
+}
 
-            toast.classList.remove('translate-y-20', 'opacity-0');
-            
-            setTimeout(() => {
-                toast.classList.add('translate-y-20', 'opacity-0');
-            }, 3000);
-        }
-    </script>
+function navigatePreview(delta){
+  const visible = getVisibleFiles();
+  if (!visible.length) return;
+  if (state.previewIndex == null) state.previewIndex = 0;
+  state.previewIndex = (state.previewIndex + delta + visible.length) % visible.length;
+  renderPreview(visible[state.previewIndex]);
+}
+
+async function renderPreview(f){
+  state.previewKey = f.key;
+  document.getElementById('previewTitle').textContent = f.name;
+  const body = document.getElementById('previewBody');
+  body.innerHTML = 'Yükleniyor...';
+  const data = await api(`/api/presign?bucket=${state.bucket}&key=${encodeURIComponent(f.key)}&expires=600`);
+  const ext = extOf(f.name);
+  if (isImage(ext)) body.innerHTML = `<img src="${data.url}">`;
+  else if (isVideo(ext)) body.innerHTML = `<video src="${data.url}" controls autoplay></video>`;
+  else if (isPdf(ext)) body.innerHTML = `<iframe src="${data.url}"></iframe>`;
+  else if (['txt','md','json','log','py','js','css','html','csv'].includes(ext)) {
+    const r = await fetch(data.url); const txt = await r.text();
+    body.innerHTML = `<pre style="color:#eee;text-align:left;padding:16px;white-space:pre-wrap;max-height:65vh;overflow:auto;">${txt.replace(/</g,'&lt;').slice(0,20000)}</pre>`;
+  } else {
+    body.innerHTML = `<div style="color:#eee;padding:30px;">Bu dosya türü için önizleme yok. <a href="${data.url}" target="_blank" style="color:var(--accent);">İndirmek için tıkla</a></div>`;
+  }
+}
+
+document.addEventListener('keydown', (e)=>{
+  const modal = document.getElementById('previewModal');
+  if (modal.style.display !== 'flex') return;
+  if (e.key === 'ArrowLeft') navigatePreview(-1);
+  else if (e.key === 'ArrowRight') navigatePreview(1);
+  else if (e.key === 'Escape') closePreviewModal();
+});
+
+
+function closePreviewModal(){
+  const body = document.getElementById('previewBody');
+  const vid = body.querySelector('video');
+  if (vid) { vid.pause(); vid.removeAttribute('src'); vid.load(); }
+  body.innerHTML = '';
+  document.getElementById('previewModal').style.display = 'none';
+}
+
+async function copyPreviewPublicLink(){
+  if (!state.previewKey) return;
+  try {
+    const d = await api(`/api/public-url?bucket=${state.bucket}&key=${encodeURIComponent(state.previewKey)}`);
+    navigator.clipboard.writeText(d.url);
+    showToast('Kalıcı link kopyalandı', 'success');
+  } catch(e) {}
+}
+
+async function copyPreviewSignedLink(){
+  if (!state.previewKey) return;
+  const d = await api(`/api/presign?bucket=${state.bucket}&key=${encodeURIComponent(state.previewKey)}&expires=86400`);
+  navigator.clipboard.writeText(d.url);
+  showToast('Geçici link kopyalandı (24 saat)', 'success');
+}
+
+async function deletePreviewFile(){
+  if (!state.previewKey) return;
+  if (!confirm('Bu dosya silinsin mi?')) return;
+  const key = state.previewKey;
+  await api('/api/delete', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({bucket: state.bucket, keys:[key]})});
+  showToast('Silindi', 'success');
+  closePreviewModal();
+  refresh();
+}
+
+// ---- Yeni klasor ----
+document.getElementById('newFolderBtn').onclick = () => { document.getElementById('folderName').value=''; openModalEl('folderModalBack'); };
+async function submitNewFolder(){
+  const name = document.getElementById('folderName').value.trim();
+  if (!name) return;
+  await api('/api/mkdir', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({bucket: state.bucket, prefix: state.prefix, name})});
+  showToast('Klasör oluşturuldu', 'success');
+  closeModal('folderModalBack');
+  refresh();
+}
+
+// ---- Bucket ekleme ----
+document.getElementById('addBucketBtn').onclick = () => openModalEl('bucketModalBack');
+async function submitAddBucket(){
+  const payload = {
+    key: document.getElementById('b_key').value.trim(),
+    name: document.getElementById('b_name').value.trim(),
+    access_key_id: document.getElementById('b_ak').value.trim(),
+    secret_access_key: document.getElementById('b_sk').value.trim(),
+    bucket_name: document.getElementById('b_bn').value.trim(),
+    endpoint_url: document.getElementById('b_ep').value.trim(),
+    region: document.getElementById('b_region').value.trim(),
+    public_url: document.getElementById('b_pub').value.trim(),
+  };
+  await api('/api/buckets', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+  showToast('Bucket eklendi', 'success');
+  closeModal('bucketModalBack');
+  await loadBuckets();
+}
+
+// ---- Yukleme: buton / drag&drop / ctrl+v -> once onay dialogu ----
+document.getElementById('uploadBtn').onclick = () => document.getElementById('fileInput').click();
+document.getElementById('fileInput').onchange = (e) => { stageFiles(e.target.files); e.target.value=''; };
+
+const dz = document.getElementById('dropzone');
+['dragenter','dragover'].forEach(ev=> dz.addEventListener(ev, e=>{ e.preventDefault(); dz.classList.add('dragover'); }));
+['dragleave','drop'].forEach(ev=> dz.addEventListener(ev, e=>{ e.preventDefault(); dz.classList.remove('dragover'); }));
+dz.addEventListener('drop', e=>{ if (e.dataTransfer.files.length) stageFiles(e.dataTransfer.files); });
+
+document.addEventListener('paste', (e)=>{
+  const items = e.clipboardData.files;
+  if (items && items.length) stageFiles(items);
+});
+
+function stageFiles(fileList){
+  const files = [...fileList];
+  if (!files.length) return;
+  state.pendingUploads = files.map((file, i) => {
+    const name = file.name || `yapistirilan_${Date.now()}_${i}.png`;
+    return { file, name, id: 'pu_'+i+'_'+Math.random().toString(36).slice(2) };
+  });
+  document.getElementById('uploadTargetPrefix').value = state.prefix;
+  renderUploadConfirmList();
+  openModalEl('uploadConfirmBack');
+}
+
+function existingNames(){
+  return new Set(state.files.map(f=>f.name));
+}
+
+function renderUploadConfirmList(){
+  const list = document.getElementById('uploadList');
+  const targetPrefix = document.getElementById('uploadTargetPrefix').value;
+  const sameFolder = targetPrefix === state.prefix;
+  const existing = sameFolder ? existingNames() : new Set();
+  list.innerHTML = '';
+  state.pendingUploads.forEach(pu => {
+    const row = document.createElement('div');
+    row.className = 'upload-row';
+    const dup = existing.has(pu.name);
+    row.innerHTML = `${iconFor(extOf(pu.name))}
+      <input type="text" value="${pu.name}" data-id="${pu.id}">
+      <span class="u-status ${dup?'dup':''}" data-status-for="${pu.id}">${dup? ICONS.warn+' zaten var, atlanacak' : fmtSize(pu.file.size)}</span>`;
+    const inp = row.querySelector('input');
+    inp.oninput = () => {
+      pu.name = inp.value.trim();
+      const nowDup = existing.has(pu.name);
+      row.querySelector('.u-status').className = 'u-status ' + (nowDup?'dup':'');
+      row.querySelector('.u-status').innerHTML = nowDup ? ICONS.warn+' zaten var, atlanacak' : fmtSize(pu.file.size);
+    };
+    list.appendChild(row);
+  });
+}
+document.getElementById('uploadTargetPrefix').addEventListener('input', renderUploadConfirmList);
+
+function cancelUploadConfirm(){
+  state.pendingUploads = [];
+  closeModal('uploadConfirmBack');
+}
+
+function confirmUpload(){
+  const targetPrefix = document.getElementById('uploadTargetPrefix').value;
+  const sameFolder = targetPrefix === state.prefix;
+  const existing = sameFolder ? existingNames() : new Set();
+  const toUpload = state.pendingUploads.filter(pu => pu.name && !existing.has(pu.name));
+  const skipped = state.pendingUploads.length - toUpload.length;
+  closeModal('uploadConfirmBack');
+  toUpload.forEach(pu => queueUpload(pu.file, pu.name, targetPrefix));
+  if (skipped > 0) showToast(`${skipped} dosya zaten var oldugu icin atlandi`, '');
+  state.pendingUploads = [];
+}
+
+// ---- Yukleme kuyrugu: ayni anda en fazla N dosya, cok sayida/buyuk dosyada
+// tarayiciyi/agi tikamamak icin. Her dosyanin kendi ilerleme cubugu var. ----
+const MAX_CONCURRENT_UPLOADS = 3;
+state.uploadQueue = [];
+state.activeUploads = 0;
+state.uploadsPendingRefresh = false;
+
+function queueUpload(file, name, prefix){
+  state.uploadQueue.push({file, name, prefix});
+  processUploadQueue();
+}
+
+function processUploadQueue(){
+  while (state.activeUploads < MAX_CONCURRENT_UPLOADS && state.uploadQueue.length > 0) {
+    const item = state.uploadQueue.shift();
+    state.activeUploads++;
+    uploadOne(item.file, item.name, item.prefix, () => {
+      state.activeUploads--;
+      processUploadQueue();
+      if (state.activeUploads === 0 && state.uploadQueue.length === 0 && state.uploadsPendingRefresh) {
+        state.uploadsPendingRefresh = false;
+        refresh();
+        loadBucketStats(true);
+      }
+    });
+  }
+}
+
+function uploadOne(file, name, prefix, onDone){
+  const id = 'up_' + Math.random().toString(36).slice(2);
+  const box = document.createElement('div');
+  box.className = 'up-item';
+  box.id = id;
+  box.innerHTML = `<div>${name}</div><div class="bar"><div></div></div><div class="u-pct">${fmtSize(file.size)}</div>`;
+  document.getElementById('uploads').appendChild(box);
+
+  const fd = new FormData();
+  fd.append('bucket', state.bucket);
+  fd.append('prefix', prefix);
+  fd.append('filename', name);
+  fd.append('file', file);
+
+  const xhr = new XMLHttpRequest();
+  xhr.open('POST', '/api/upload');
+  xhr.upload.onprogress = (e) => {
+    if (e.lengthComputable) {
+      const pct = Math.round((e.loaded/e.total)*100);
+      box.querySelector('.bar > div').style.width = pct + '%';
+      box.querySelector('.u-pct').textContent = pct + '%';
+    }
+  };
+  xhr.onload = () => {
+    box.remove();
+    if (xhr.status >= 200 && xhr.status < 300) {
+      showToast(name + ' yüklendi', 'success');
+      if (prefix === state.prefix) state.uploadsPendingRefresh = true;
+    } else {
+      showToast(name + ' yüklenemedi', 'error');
+    }
+    onDone();
+  };
+  xhr.onerror = () => { box.remove(); showToast(name + ' yüklenemedi', 'error'); onDone(); };
+  xhr.send(fd);
+}
+
+// ---- Arama ----
+document.getElementById('searchBox').oninput = (e) => renderGrid(e.target.value);
+
+// ---- Sıralama ----
+state.sortBy = localStorage.getItem('s3m_sort') || 'name_asc';
+document.getElementById('sortSelect').value = state.sortBy;
+document.getElementById('sortSelect').onchange = (e) => {
+  state.sortBy = e.target.value;
+  localStorage.setItem('s3m_sort', state.sortBy);
+  renderGrid(document.getElementById('searchBox').value);
+};
+
+// ---- Görünüm (ızgara / liste) ----
+state.viewMode = localStorage.getItem('s3m_view') || 'grid';
+function applyViewMode(){
+  document.getElementById('grid').className = state.viewMode === 'list' ? 'list-view' : '';
+  document.getElementById('viewToggleBtn').innerHTML = state.viewMode === 'list' ? ICONS.grid : ICONS.list;
+}
+document.getElementById('viewToggleBtn').onclick = () => {
+  state.viewMode = state.viewMode === 'list' ? 'grid' : 'list';
+  localStorage.setItem('s3m_view', state.viewMode);
+  applyViewMode();
+};
+
+// ---- Init ----
+(async function init(){
+  document.querySelector('header h1').innerHTML = ICONS.bucket + ' S3 Manager';
+  document.getElementById('addBucketBtn').innerHTML = ICONS.plus + ' Bucket';
+  document.getElementById('newFolderBtn').innerHTML = ICONS.folderPlus + ' Klasör';
+  document.getElementById('uploadBtn').innerHTML = ICONS.upload + ' Yükle';
+  applyViewMode();
+  await loadBuckets();
+  await refresh();
+  loadBucketStats();
+})();
+</script>
 </body>
 </html>
 """
 
-# --- ROUTES ---
-
-# --- ROUTES ---
-
-@app.route('/set_bucket/<name>')
-def set_bucket(name):
-    if name in PROFILES:
-        session['active_profile'] = name
-    return redirect(url_for('index'))
 
 @app.route('/')
 def index():
-    prefix = request.args.get('prefix', '')
-    continuation_token = request.args.get('continuation_token', '')
-    
-    folders, files, next_token, error = list_files(prefix, continuation_token)
-    
-    if error:
-        flash(f'Error accessing S3: {error}', 'error')
-    
-    return render_template_string(HTML_TEMPLATE, 
-                                  folders=folders, 
-                                  files=files, 
-                                  prefix=prefix, 
-                                  next_token=next_token,
-                                  bucket_name=get_bucket(),
-                                  current_profile_name=get_current_config()['name'])
+    return render_template_string(INDEX_HTML)
 
-@app.route('/get_upload_link', methods=['POST'])
-def get_upload_link():
-    data = request.json
-    filename = data.get('filename')
-    prefix = data.get('prefix', '')
-    
-    if not filename:
-        return {"error": "Missing filename"}, 400
-        
-    s3 = get_s3_client()
-    key = prefix + filename
-    
-    print(f"DEBUG: Checking key='{key}'")
-    try:
-        s3.head_object(Bucket=get_bucket(), Key=key)
-        print(f"DEBUG: Found existing key='{key}'")
-        return {"error": "File already exists", "exists": True}, 409
-    except ClientError as e:
-        # Check for 404 or NoSuchKey
-        code = e.response.get('Error', {}).get('Code', '')
-        if code != '404' and code != 'NoSuchKey':
-             print(f"DEBUG: Error checking key='{key}': {e}")
-             return {"error": str(e)}, 500
-         # If 404, proceed
-    
-    try:
-        # Generate presigned URL for PUT (Direct Upload)
-        # ContentType is important for the browser to send it correctly
-        content_type = mimetypes.guess_type(filename)[0] or 'application/octet-stream'
-        
-        url = s3.generate_presigned_url(
-            'put_object',
-            Params={
-                'Bucket': get_bucket(), 
-                'Key': key,
-                'ContentType': content_type
-            },
-            ExpiresIn=3600
-        )
-        return {"url": url, "key": key, "content_type": content_type}
-    except ClientError as e:
-        return {"error": str(e)}, 500
-
-@app.route('/get_link')
-def get_link():
-    key = request.args.get('key')
-    want_public = request.args.get('public') == 'true'
-    
-    if not key:
-        return {"error": "Missing key"}, 400
-        
-    # Use Public URL ONLY if requested and available
-    public_url = get_current_config().get('public_url')
-    if want_public and public_url:
-        # Ensure trailing slash on public url and no leading slash on key
-        base = public_url.rstrip('/')
-        clean_key = key.lstrip('/')
-        url = f"{base}/{clean_key}"
-    else:
-        # Default to PRESIGNED URL for everything else (Preview, Open, Download)
-        s3 = get_s3_client()
-        try:
-            url = s3.generate_presigned_url(
-                'get_object',
-                Params={'Bucket': get_bucket(), 'Key': key},
-                ExpiresIn=3600 * 24
-            )
-        except ClientError as e:
-            return {"error": str(e)}, 500
-
-    return {"url": url}
-
-@app.route('/mkdir', methods=['POST'])
-def mkdir():
-    s3 = get_s3_client()
-    prefix = request.form.get('prefix', '')
-    folder_name = request.form.get('folder_name', '').strip()
-    
-    if not folder_name:
-        flash('Folder name is required', 'error')
-        return redirect(url_for('index', prefix=prefix))
-        
-    if not folder_name.endswith('/'):
-        folder_name += '/'
-        
-    try:
-        key = prefix + folder_name
-        s3.put_object(Bucket=get_bucket(), Key=key)
-        flash(f'Folder {folder_name} created!', 'success')
-    except ClientError as e:
-        flash(f'Folder creation failed: {str(e)}', 'error')
-        
-    return redirect(url_for('index', prefix=prefix))
-
-@app.route('/delete', methods=['POST'])
-def delete():
-    s3 = get_s3_client()
-    key = request.form.get('key')
-    prefix = request.form.get('prefix', '')
-    
-    if not key:
-        flash('No key provided for deletion', 'error')
-        return redirect(url_for('index', prefix=prefix))
-        
-    try:
-        if key.endswith('/'):
-            objects_to_delete = s3.list_objects_v2(Bucket=get_bucket(), Prefix=key)
-            if 'Contents' in objects_to_delete:
-                delete_keys = [{'Key': obj['Key']} for obj in objects_to_delete['Contents']]
-                s3.delete_objects(Bucket=get_bucket(), Delete={'Objects': delete_keys})
-        else:
-            s3.delete_object(Bucket=get_bucket(), Key=key)
-            
-        flash(f'Item deleted successfully', 'success')
-    except ClientError as e:
-        flash(f'Deletion failed: {str(e)}', 'error')
-        
-    return redirect(url_for('index', prefix=prefix))
-
-@app.route('/download')
-def download():
-    key = request.args.get('key')
-    
-    if not key:
-        return "Missing key", 400
-        
-    s3 = get_s3_client()
-    try:
-        url = s3.generate_presigned_url(
-            'get_object',
-            Params={'Bucket': get_bucket(), 'Key': key},
-            ExpiresIn=3600
-        )
-        return redirect(url)
-    except ClientError as e:
-        return f"Error generating download link: {str(e)}", 500
-
-@app.route('/rename', methods=['POST'])
-def rename():
-    s3 = get_s3_client()
-    old_key = request.form.get('old_key')
-    new_key = request.form.get('new_key').strip()
-    
-    if not old_key or not new_key:
-        flash('Missing filenames', 'error')
-        return redirect(url_for('index'))
-        
-    try:
-        # Check if identical
-        if old_key == new_key:
-            flash('New name is same as old name', 'warning')
-            return redirect(url_for('index', prefix=os.path.dirname(old_key)))
-
-        # Handle Folder Rename (Prefix)
-        if old_key.endswith('/'):
-            # Ensure new key also ends with /
-            if not new_key.endswith('/'):
-                new_key += '/'
-                
-            # List all objects in the old folder
-            objects = s3.list_objects_v2(Bucket=get_bucket(), Prefix=old_key)
-            if 'Contents' in objects:
-                for obj in objects['Contents']:
-                    old_obj_key = obj['Key']
-                    # Replace prefix
-                    new_obj_key = new_key + old_obj_key[len(old_key):]
-                    
-                    # Copy
-                    copy_source = {'Bucket': get_bucket(), 'Key': old_obj_key}
-                    s3.copy_object(CopySource=copy_source, Bucket=get_bucket(), Key=new_obj_key)
-                    # Delete
-                    s3.delete_object(Bucket=get_bucket(), Key=old_obj_key)
-            
-            # Put empty folder marker to accept the move
-            s3.put_object(Bucket=get_bucket(), Key=new_key)
-            
-            # Also delete average folder marker if it exists
-            s3.delete_object(Bucket=get_bucket(), Key=old_key)
-
-            flash(f'Folder renamed to {new_key}', 'success')
-            
-        else:
-            # File Rename
-            copy_source = {'Bucket': get_bucket(), 'Key': old_key}
-            s3.copy_object(CopySource=copy_source, Bucket=get_bucket(), Key=new_key)
-            s3.delete_object(Bucket=get_bucket(), Key=old_key)
-            flash(f'Renamed to {new_key}', 'success')
-            
-    except ClientError as e:
-        flash(f'Rename failed: {str(e)}', 'error')
-        
-    # Redirect to the folder of the NEW key
-    new_prefix = os.path.dirname(new_key.rstrip('/'))
-    if new_prefix: new_prefix += '/'
-    else: new_prefix = ''
-    
-    return redirect(url_for('index', prefix=new_prefix))
-
-def configure_cors():
-    """Configures CORS to allow direct browser uploads for all configured buckets."""
-    configured_buckets = set()
-    
-    for profile_key, config in PROFILES.items():
-        bucket_name = config['bucket_name']
-        if bucket_name in configured_buckets:
-            continue
-            
-        try:
-            print(f"Configuring CORS for bucket '{bucket_name}' (via {profile_key})...")
-            # Create a dedicated client for this setup to avoid session dependency
-            s3 = boto3.client(
-                's3',
-                aws_access_key_id=config['access_key_id'],
-                aws_secret_access_key=config['secret_access_key'],
-                endpoint_url=config['endpoint_url'],
-                region_name=config['region']
-            )
-            
-            cors_configuration = {
-                'CORSRules': [{
-                    'AllowedHeaders': ['*'],
-                    'AllowedMethods': ['GET', 'PUT', 'POST', 'HEAD'],
-                    'AllowedOrigins': ['*'],
-                    'ExposeHeaders': ['ETag']
-                }]
-            }
-            s3.put_bucket_cors(Bucket=bucket_name, CORSConfiguration=cors_configuration)
-            print(f"✅ CORS configuration successfully applied to bucket {bucket_name}.")
-            configured_buckets.add(bucket_name)
-        except ClientError as e:
-            print(f"⚠️ Failed to apply CORS configuration to {bucket_name}: {e}")
-        except Exception as e:
-            print(f"⚠️ Unexpected error configuring CORS for {bucket_name}: {e}")
 
 if __name__ == '__main__':
-    # Apply CORS on startup to ensure direct uploads work
-    configure_cors()
-    
-    app.run(host='0.0.0.0', debug=True, port=5000)
+    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
