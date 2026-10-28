@@ -5,7 +5,7 @@ S3 / Cloudflare R2 Manager - Tek dosyalık Flask uygulaması
 - 2 bucket kod içinde gömülü (daha sonra .env'e taşınabilir)
 - Arayüzden bucket ekleme / değiştirme (buckets_extra.json'a kaydedilir)
 - Sürükle-bırak, Ctrl+V ile yapıştırma, çoklu yükleme + ilerleme çubuğu
-- Linkten (URL) yükleme: sunucu indirir, direkt bucket'a stream eder
+- Link (URL) ile dosya yükleme: doğrudan uzak sunucudan S3/R2'ye aktarım
 - Klasör mantığı (prefix tabanlı), yeniden adlandırma, taşıma (aynı/farklı bucket)
 - Public link ve signed (presigned) link oluşturma
 - Önizleme: resim/video/pdf için presigned URL ile direkt tarayıcıda (server proxy yok -> hızlı)
@@ -18,16 +18,14 @@ S3 / Cloudflare R2 Manager - Tek dosyalık Flask uygulaması
 
 import os
 import io
-import re
 import json
-import socket
-import ipaddress
 import mimetypes
 import posixpath
 import threading
-import urllib.parse
-import urllib.request
 from datetime import datetime
+import urllib.request
+import urllib.parse
+import urllib.error
 
 from flask import Flask, request, jsonify, render_template_string, Response
 import boto3
@@ -297,67 +295,80 @@ def api_upload():
 
 
 # ------------------------------------------------------------------
-# API: linkten yükleme (sunucu indirir, direkt bucket'a stream eder)
+# API: link ile dosya yukleme (URL'den doğrudan sunucuya akıtıp S3'e kaydetme)
 # ------------------------------------------------------------------
-def _is_safe_url(url):
-    p = urllib.parse.urlparse(url)
-    if p.scheme not in ('http', 'https') or not p.hostname:
-        return False
-    try:
-        for info in socket.getaddrinfo(p.hostname, None):
-            ip = ipaddress.ip_address(info[4][0])
-            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
-                return False
-    except Exception:
-        return False
-    return True
-
-
-def _filename_from_response(resp, url):
-    cd = resp.headers.get('Content-Disposition', '')
-    m = re.search(r"filename\*=UTF-8''([^;]+)", cd) or re.search(r'filename="?([^";]+)"?', cd)
-    if m:
-        name = urllib.parse.unquote(m.group(1)).strip()
-        if name:
-            return posixpath.basename(name)
-    name = posixpath.basename(urllib.parse.unquote(urllib.parse.urlparse(url).path))
-    return name or f"indirilen_{int(datetime.utcnow().timestamp())}"
-
-
 @app.route('/api/upload-url', methods=['POST'])
 def api_upload_url():
     data = request.get_json(force=True)
     bucket_key = data.get('bucket', DEFAULT_BUCKET)
     prefix = data.get('prefix', '')
-    url = (data.get('url') or '').strip()
-    custom_name = (data.get('filename') or '').strip()
     if prefix and not prefix.endswith('/'):
         prefix += '/'
-    if not _is_safe_url(url):
-        return jsonify({'error': 'Gecersiz veya izin verilmeyen link'}), 400
+    url = (data.get('url') or '').strip()
+    custom_filename = (data.get('filename') or '').strip()
+
+    if not url or not (url.startswith('http://') or url.startswith('https://')):
+        return jsonify({'error': 'Geçerli bir http:// veya https:// linki girin'}), 400
 
     cfg = bucket_cfg(bucket_key)
     client = get_client(bucket_key)
-    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            if not _is_safe_url(resp.geturl()):
-                return jsonify({'error': 'Yonlendirme izin verilmeyen bir adrese gidiyor'}), 400
-            name = custom_name or _filename_from_response(resp, url)
-            key = prefix + name
-            content_type = (resp.headers.get('Content-Type', '').split(';')[0].strip()
-                            or mimetypes.guess_type(name)[0] or 'application/octet-stream')
+        req = urllib.request.Request(
+            url,
+            headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            }
+        )
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            # 1. Dosya adı belirleme
+            filename = custom_filename
+            if not filename:
+                # Content-Disposition header kontrolü
+                cd = resp.headers.get('Content-Disposition', '')
+                if 'filename=' in cd:
+                    filename = cd.split('filename=')[-1].split(';')[0].strip(' "\'')
+                if not filename:
+                    parsed_path = urllib.parse.unquote(urllib.parse.urlsplit(url).path)
+                    filename = posixpath.basename(parsed_path.rstrip('/'))
+                if not filename:
+                    filename = f"url_{int(datetime.utcnow().timestamp())}"
+
+            # 2. Content-Type ve uzantı kontrolü
+            content_type = resp.headers.get_content_type()
+            if '.' not in filename and content_type:
+                guessed_ext = mimetypes.guess_extension(content_type)
+                if guessed_ext:
+                    filename += guessed_ext
+
+            if not content_type or content_type == 'application/octet-stream':
+                content_type = mimetypes.guess_type(filename)[0] or 'application/octet-stream'
+
+            key = prefix + filename
+
+            # 3. Akış şeklinde (streaming) S3 / R2'ye yükleme
             client.upload_fileobj(
-                resp, cfg['bucket_name'], key,
+                resp,
+                cfg['bucket_name'],
+                key,
                 ExtraArgs={'ContentType': content_type},
                 Config=TRANSFER_CONFIG,
             )
-    except ClientError as e:
-        return jsonify({'error': str(e)}), 500
-    except Exception as e:
-        return jsonify({'error': f'Indirilemedi: {e}'}), 500
 
-    return jsonify({'ok': True, 'key': key, 'public_url': public_url_for(bucket_key, key)})
+            return jsonify({
+                'ok': True,
+                'key': key,
+                'name': filename,
+                'public_url': public_url_for(bucket_key, key),
+            })
+    except urllib.error.HTTPError as e:
+        return jsonify({'error': f'Sunucu HTTP hatası verdi: {e.code} {e.reason}'}), 400
+    except urllib.error.URLError as e:
+        return jsonify({'error': f'Linke ulaşılamadı: {e.reason}'}), 400
+    except ClientError as e:
+        return jsonify({'error': f'S3 hatası: {str(e)}'}), 500
+    except Exception as e:
+        return jsonify({'error': f'Hata: {str(e)}'}), 500
 
 
 # ------------------------------------------------------------------
@@ -607,7 +618,7 @@ INDEX_HTML = r"""
   .btn.small{padding:4px 8px;font-size:11.5px;}
   #searchBox{flex:1;min-width:110px;background:var(--panel2);border:1px solid var(--border);
        color:var(--text);border-radius:var(--radius-sm);padding:6px 10px;font-size:12.5px;}
-  #searchBox:focus, select:focus, input:focus, textarea:focus{outline:none;border-color:var(--accent);}
+  #searchBox:focus, select:focus, input:focus{outline:none;border-color:var(--accent);}
 
   .breadcrumb{display:flex;align-items:center;gap:2px;padding:8px 14px;background:var(--panel);
        border-bottom:1px solid var(--border-soft);font-size:12px;color:var(--muted);flex-wrap:wrap;}
@@ -685,9 +696,6 @@ INDEX_HTML = r"""
   .modal label{display:block;font-size:11px;color:var(--muted);margin:10px 0 4px;}
   .modal input, .modal select{width:100%;background:var(--panel2);border:1px solid var(--border);
        color:var(--text);border-radius:var(--radius-sm);padding:8px 9px;font-size:12.5px;}
-  .modal textarea{width:100%;background:var(--panel2);border:1px solid var(--border);
-       color:var(--text);border-radius:var(--radius-sm);padding:8px 9px;font-size:12.5px;
-       font-family:inherit;resize:vertical;}
   .modal .row-btns{display:flex;gap:8px;justify-content:flex-end;margin-top:16px;}
   .link-row{display:flex;gap:6px;margin-top:6px;}
   .link-row input{flex:1;}
@@ -764,7 +772,7 @@ INDEX_HTML = r"""
     <button class="btn" id="addBucketBtn">Bucket</button>
     <button class="btn" id="newFolderBtn">Klasör</button>
     <button class="btn primary" id="uploadBtn">Yükle</button>
-    <button class="btn" id="urlBtn" title="Linkten yükle">Link</button>
+    <button class="btn" id="urlUploadBtn">Linkten Ekle</button>
     <input type="file" id="fileInput" multiple style="display:none;">
     <button class="btn small" id="viewToggleBtn" title="Görünümü değiştir"></button>
     <select id="sortSelect" title="Sırala">
@@ -815,6 +823,23 @@ INDEX_HTML = r"""
     <div class="row-btns">
       <button class="btn" onclick="closeModal('bucketModalBack')">İptal</button>
       <button class="btn primary" onclick="submitAddBucket()">Ekle</button>
+    </div>
+  </div>
+</div>
+
+<!-- Linkten dosya yükleme modal -->
+<div class="modal-back" id="urlUploadModalBack">
+  <div class="modal">
+    <h3>Linkten Dosya Ekle</h3>
+    <label>Dosya Linki (URL)</label>
+    <input id="urlUploadLink" placeholder="https://example.com/dosya.zip veya görsel linki">
+    <label>Dosya Adı (opsiyonel, boş bırakılırsa linkten alınır)</label>
+    <input id="urlUploadFilename" placeholder="örn: ozel_dosya_adi.png">
+    <label>Hedef Klasör</label>
+    <input id="urlUploadPrefix" placeholder="örn: fotolar/">
+    <div class="row-btns">
+      <button class="btn" onclick="closeModal('urlUploadModalBack')">İptal</button>
+      <button class="btn primary" id="submitUrlUploadBtn" onclick="submitUrlUpload()">İndir ve Yükle</button>
     </div>
   </div>
 </div>
@@ -886,21 +911,6 @@ INDEX_HTML = r"""
     <div class="row-btns">
       <button class="btn" onclick="cancelUploadConfirm()">İptal</button>
       <button class="btn primary" onclick="confirmUpload()">Yükle</button>
-    </div>
-  </div>
-</div>
-
-<!-- Linkten yükleme modal -->
-<div class="modal-back" id="urlModalBack">
-  <div class="modal" style="width:min(480px,92vw);">
-    <h3>Linkten Yükle</h3>
-    <label>Hedef Klasör</label><input id="urlTargetPrefix">
-    <label>Linkler (her satıra bir tane)</label>
-    <textarea id="urlList" rows="6" placeholder="https://ornek.com/dosya.jpg"></textarea>
-    <label>Dosya adı (opsiyonel, yalnızca tek link için)</label><input id="urlFilename">
-    <div class="row-btns">
-      <button class="btn" onclick="closeModal('urlModalBack')">İptal</button>
-      <button class="btn primary" onclick="submitUrlUpload()">Yükle</button>
     </div>
   </div>
 </div>
@@ -1393,6 +1403,59 @@ async function submitAddBucket(){
   await loadBuckets();
 }
 
+// ---- Linkten dosya yukleme modal / islemleri ----
+document.getElementById('urlUploadBtn').onclick = () => openUrlUploadModal();
+
+function openUrlUploadModal(prefillUrl=''){
+  document.getElementById('urlUploadLink').value = prefillUrl;
+  document.getElementById('urlUploadFilename').value = '';
+  document.getElementById('urlUploadPrefix').value = state.prefix;
+  const btn = document.getElementById('submitUrlUploadBtn');
+  btn.disabled = false;
+  btn.textContent = 'İndir ve Yükle';
+  openModalEl('urlUploadModalBack');
+  setTimeout(() => {
+    document.getElementById(prefillUrl ? 'urlUploadFilename' : 'urlUploadLink').focus();
+  }, 60);
+}
+
+async function submitUrlUpload(){
+  const url = document.getElementById('urlUploadLink').value.trim();
+  const filename = document.getElementById('urlUploadFilename').value.trim();
+  const prefix = document.getElementById('urlUploadPrefix').value.trim();
+
+  if (!url) {
+    showToast('Lütfen geçerli bir bağlantı adresi (URL) girin', 'error');
+    return;
+  }
+
+  const btn = document.getElementById('submitUrlUploadBtn');
+  btn.disabled = true;
+  btn.textContent = 'İndiriliyor ve yükleniyor...';
+
+  try {
+    const data = await api('/api/upload-url', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        bucket: state.bucket,
+        prefix: prefix,
+        url: url,
+        filename: filename
+      })
+    });
+    showToast((data.name || 'Dosya') + ' linkten başarıyla yüklendi', 'success');
+    closeModal('urlUploadModalBack');
+    refresh();
+    loadBucketStats(true);
+  } catch(e) {
+    // api() fonksiyonu hata toastunu otomatik gosterir
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'İndir ve Yükle';
+  }
+}
+
 // ---- Yukleme: buton / drag&drop / ctrl+v -> once onay dialogu ----
 document.getElementById('uploadBtn').onclick = () => document.getElementById('fileInput').click();
 document.getElementById('fileInput').onchange = (e) => { stageFiles(e.target.files); e.target.value=''; };
@@ -1404,7 +1467,20 @@ dz.addEventListener('drop', e=>{ if (e.dataTransfer.files.length) stageFiles(e.d
 
 document.addEventListener('paste', (e)=>{
   const items = e.clipboardData.files;
-  if (items && items.length) stageFiles(items);
+  if (items && items.length) {
+    stageFiles(items);
+    return;
+  }
+  // Eğer herhangi bir form input/textarea içinde değilsek ve kopyalanan metin http:// veya https:// ise link modalını aç
+  const activeEl = document.activeElement;
+  const isInput = activeEl && (activeEl.tagName === 'INPUT' || activeEl.tagName === 'TEXTAREA');
+  if (!isInput) {
+    const text = (e.clipboardData.getData('text') || '').trim();
+    if (text.startsWith('http://') || text.startsWith('https://')) {
+      e.preventDefault();
+      openUrlUploadModal(text);
+    }
+  }
 });
 
 function stageFiles(fileList){
@@ -1481,7 +1557,7 @@ function processUploadQueue(){
   while (state.activeUploads < MAX_CONCURRENT_UPLOADS && state.uploadQueue.length > 0) {
     const item = state.uploadQueue.shift();
     state.activeUploads++;
-    const done = () => {
+    uploadOne(item.file, item.name, item.prefix, () => {
       state.activeUploads--;
       processUploadQueue();
       if (state.activeUploads === 0 && state.uploadQueue.length === 0 && state.uploadsPendingRefresh) {
@@ -1489,9 +1565,7 @@ function processUploadQueue(){
         refresh();
         loadBucketStats(true);
       }
-    };
-    if (item.url) uploadFromUrl(item.url, item.name, item.prefix, done);
-    else uploadOne(item.file, item.name, item.prefix, done);
+    });
   }
 }
 
@@ -1532,50 +1606,6 @@ function uploadOne(file, name, prefix, onDone){
   xhr.send(fd);
 }
 
-// ---- Linkten yukleme: sunucu dosyayi indirip dogrudan bucket'a gonderir ----
-document.getElementById('urlBtn').onclick = () => {
-  document.getElementById('urlTargetPrefix').value = state.prefix;
-  document.getElementById('urlList').value = '';
-  document.getElementById('urlFilename').value = '';
-  openModalEl('urlModalBack');
-};
-
-function submitUrlUpload(){
-  const prefix = document.getElementById('urlTargetPrefix').value;
-  const urls = document.getElementById('urlList').value.split('\n').map(s=>s.trim()).filter(Boolean);
-  if (!urls.length) return;
-  const custom = urls.length === 1 ? document.getElementById('urlFilename').value.trim() : '';
-  closeModal('urlModalBack');
-  urls.forEach(u => state.uploadQueue.push({url: u, name: custom, prefix}));
-  processUploadQueue();
-}
-
-async function uploadFromUrl(url, customName, prefix, onDone){
-  let label = customName;
-  if (!label) {
-    try { label = decodeURIComponent(url.split('?')[0].split('/').pop()); } catch(e) { label = ''; }
-  }
-  label = label || url;
-  const box = document.createElement('div');
-  box.className = 'up-item';
-  box.innerHTML = `<div></div><div class="u-pct">Linkten indiriliyor...</div>`;
-  box.firstChild.textContent = label;
-  document.getElementById('uploads').appendChild(box);
-  try {
-    const res = await fetch('/api/upload-url', {method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({bucket: state.bucket, prefix, url, filename: customName})});
-    const data = await res.json().catch(()=>({}));
-    if (!res.ok || data.error) throw new Error(data.error || 'hata');
-    showToast(data.key.split('/').pop() + ' yüklendi', 'success');
-    if (prefix === state.prefix) state.uploadsPendingRefresh = true;
-  } catch (e) {
-    showToast(label + ': ' + e.message, 'error');
-  } finally {
-    box.remove();
-    onDone();
-  }
-}
-
 // ---- Arama ----
 document.getElementById('searchBox').oninput = (e) => renderGrid(e.target.value);
 
@@ -1606,7 +1636,7 @@ document.getElementById('viewToggleBtn').onclick = () => {
   document.getElementById('addBucketBtn').innerHTML = ICONS.plus + ' Bucket';
   document.getElementById('newFolderBtn').innerHTML = ICONS.folderPlus + ' Klasör';
   document.getElementById('uploadBtn').innerHTML = ICONS.upload + ' Yükle';
-  document.getElementById('urlBtn').innerHTML = ICONS.link + ' Link';
+  document.getElementById('urlUploadBtn').innerHTML = ICONS.link + ' Linkten Ekle';
   applyViewMode();
   await loadBuckets();
   await refresh();
